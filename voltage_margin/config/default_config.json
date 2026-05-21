@@ -1,0 +1,9 @@
+{
+    "ci_enlargement_factor": 0.06,
+    "moments_ci_estimation_fraction": 0.10,
+    "margin_points_mv": [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50],
+    "default_waivers": {
+        "ci_enlargement": true,
+        "optimistic_direction": true
+    }
+}

@@ -1,0 +1,35 @@
+# Compiled files
+*.pyc
+__pycache__/
+*.so
+
+# Log files  
+*.log
+*.out
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Sensitive data (add your specific paths)
+# /path/to/sensitive/configs
+# *.key
+# *.secret
+
+# Large result files (if any)
+# *.lib
+# *.db
+
+# Build artifacts
+build/
+dist/

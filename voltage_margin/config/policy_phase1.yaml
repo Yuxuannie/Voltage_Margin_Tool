@@ -1,0 +1,95 @@
+version: 1
+
+units:
+  time: ps
+  voltage: V
+  sensitivity: ps_per_mv
+  margin: mV
+
+direction_rule:
+  scope: global
+  expression: "dif_ps < 0"
+
+sensitivity:
+  source: source_library
+  value_column: lib_value_ps
+  method: multivoltage_linear_fit
+  min_voltage_points: 2
+  insufficient_points_behavior: skip_with_warning
+  grouping:
+    - process
+    - process_version
+    - compare_source
+    - analysis_type
+    - metric
+    - arc
+    - corner_family
+    - temperature_c
+
+ci:
+  moments_ci_estimation_fraction: 0.10
+  estimate_when_missing: true
+
+waivers:
+  ci_enlargement:
+    enabled: true
+    factor: 0.06
+  optimistic_direction:
+    enabled: true
+    uses_direction_rule: global
+
+margin_outputs:
+  target_coverage: 0.95
+  margin_points_mv: [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+
+thresholds:
+  delay:
+    Late_Sigma:
+      rel_threshold: 0.03
+      abs_threshold: {slew_multiplier: 0.005, floor_ps: 1.0}
+    Early_Sigma:
+      rel_threshold: 0.03
+      abs_threshold: {slew_multiplier: 0.005, floor_ps: 1.0}
+    Std:
+      rel_threshold: 0.02
+      abs_threshold: {slew_multiplier: 0.005, floor_ps: 1.0}
+    Skew:
+      rel_threshold: 0.05
+      abs_threshold: {slew_multiplier: 0.005, floor_ps: 1.0}
+    Meanshift:
+      rel_threshold: 0.01
+      abs_threshold: {slew_multiplier: 0.005, floor_ps: 1.0}
+    Nominal:
+      # TODO: tune against real data; provisional Phase 1 default.
+      rel_threshold: 0.01
+      abs_threshold: {slew_multiplier: 0.005, floor_ps: 1.0}
+
+  slew:
+    Late_Sigma:
+      rel_threshold: 0.06
+      abs_threshold: {slew_multiplier: 0.01, floor_ps: 2.0}
+    Early_Sigma:
+      rel_threshold: 0.06
+      abs_threshold: {slew_multiplier: 0.01, floor_ps: 2.0}
+    Std:
+      rel_threshold: 0.04
+      abs_threshold: {slew_multiplier: 0.005, floor_ps: 1.0}
+    Skew:
+      rel_threshold: 0.10
+      abs_threshold: {slew_multiplier: 0.005, floor_ps: 1.0}
+    Meanshift:
+      rel_threshold: 0.02
+      abs_threshold: {slew_multiplier: 0.005, floor_ps: 1.0}
+    Nominal:
+      # TODO: tune against real data; provisional Phase 1 default.
+      rel_threshold: 0.02
+      abs_threshold: {slew_multiplier: 0.005, floor_ps: 1.0}
+
+  hold:
+    Late_Sigma:
+      rel_threshold: 0.03
+      abs_threshold: {slew_multiplier: 0.005, floor_ps: 10.0}
+    Nominal:
+      # TODO: tune against real data; provisional Phase 1 default.
+      rel_threshold: 0.01
+      abs_threshold: {slew_multiplier: 0.005, floor_ps: 10.0}

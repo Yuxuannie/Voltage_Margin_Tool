@@ -1,0 +1,163 @@
+version: 1
+
+file_loading:
+  format: csv
+  header: 0
+  skiprows: [1]
+  blank_lines_after_header: 1
+
+filename:
+  pattern: "^(?P<prefix>fmc|MC)_result_(?P<process>[^_]+)_(?P<process_version>[^_]+)_(?P<corner>.+?)_(?P<analysis_type>delay|slew|hold)_(?P<compare_kind>.+)\\.rpt$"
+  prefix_to_compare_source:
+    fmc: fmc_compare
+    MC: mc_compare
+  voltage_from_corner_pattern: "(?P<int>\\d+)p(?P<frac>\\d+)v"
+  temperature_from_corner_pattern: "(?P<sign>m?)(?P<temp>\\d+)c"
+
+table_type_to_analysis_type:
+  cell_rise: delay
+  cell_fall: delay
+  rise_transition: slew
+  fall_transition: slew
+  rise_constraint: hold
+  fall_constraint: hold
+
+analysis_metrics:
+  delay: [Late_Sigma, Early_Sigma, Std, Skew, Meanshift, Nominal]
+  slew: [Late_Sigma, Early_Sigma, Std, Skew, Meanshift, Nominal]
+  hold: [Late_Sigma, Nominal]
+
+canonical_columns:
+  arc: Arc
+  rel_pin_slew: rel_pin_slew
+  table_type: Table_Type
+
+arc_normalization:
+  canonical_table_position_separator: "-"
+  compare_sources:
+    fmc_compare:
+      input_table_position_separator: "_"
+      normalize_suffix_pattern: "_(?P<idx1>\\d+)_(?P<idx2>\\d+)$"
+      replacement: "_{idx1}-{idx2}"
+    mc_compare:
+      input_table_position_separator: "-"
+      normalize_suffix_pattern: "_(?P<idx1>\\d+)-(?P<idx2>\\d+)$"
+      replacement: "_{idx1}-{idx2}"
+
+cell_name:
+  fmc_compare:
+    source: column
+    column: Cell_Name
+  mc_compare:
+    source: arc
+    parse:
+      delay_slew:
+        pattern: "^combinational_(?P<cell>[A-Za-z0-9]+)_"
+      hold:
+        pattern: "^hold_(?P<cell>[A-Za-z0-9]+)_"
+
+dif_resolution:
+  source_priority: [mapped_column, computed]
+  validate_consistency: true
+  consistency_tolerance:
+    absolute_ps: 0.01
+    relative: 1.0e-6
+  on_mismatch: warn_and_use_mapped
+
+compare_sources:
+  fmc_compare:
+    required_columns: [Arc, rel_pin_slew, Table_Type, Cell_Name]
+    metrics:
+      Late_Sigma:
+        mc_value: MC_Late_Sigma
+        lib_value: CDNS_Lib_Late_Sigma
+        dif: CDNS_Lib_Late_Sigma_Dif
+        rel: CDNS_Lib_Late_Sigma_Rel
+        ci_lb: MC_Late_Sigma_LB
+        ci_ub: MC_Late_Sigma_UB
+      Early_Sigma:
+        mc_value: MC_Early_Sigma
+        lib_value: CDNS_Lib_Early_Sigma
+        dif: CDNS_Lib_Early_Sigma_Dif
+        rel: CDNS_Lib_Early_Sigma_Rel
+        ci_lb: MC_Early_Sigma_LB
+        ci_ub: MC_Early_Sigma_UB
+      Std:
+        mc_value: MC_Std
+        lib_value: CDNS_Lib_Std
+        dif: CDNS_Lib_Std_Dif
+        rel: CDNS_Lib_Std_Rel
+        ci_lb: MC_Std_LB
+        ci_ub: MC_Std_UB
+      Skew:
+        mc_value: MC_Skew
+        lib_value: CDNS_Lib_Skew
+        dif: CDNS_Lib_Skew_Dif
+        rel: CDNS_Lib_Skew_Rel
+        ci_lb: MC_Skew_LB
+        ci_ub: MC_Skew_UB
+      Meanshift:
+        mc_value: MC_Meanshift
+        lib_value: CDNS_Lib_Meanshift
+        dif: CDNS_Lib_Meanshift_Dif
+        rel: CDNS_Lib_Meanshift_Rel
+        ci_lb: MC_Meanshift_LB
+        ci_ub: MC_Meanshift_UB
+      Nominal:
+        mc_value: MC_Nominal
+        lib_value: CDNS_Lib_Nominal
+        dif: CDNS_Lib_Nominal_Dif
+        rel: CDNS_Lib_Nominal_Rel
+        ci_lb:
+        ci_ub:
+
+  mc_compare:
+    required_columns: [Arc, rel_pin_slew, Table_Type]
+    metrics:
+      Late_Sigma:
+        mc_value: MC_late_sigma
+        lib_value: Lib_late_sigma
+        dif: late_sigma_abs_err
+        rel: late_sigma_rel_err
+        ci_lb: MC_late_sigma_LB
+        ci_ub: MC_late_sigma_UB
+      Early_Sigma:
+        mc_value: MC_early_sigma
+        lib_value: Lib_early_sigma
+        dif: early_sigma_abs_err
+        rel: early_sigma_rel_err
+        ci_lb: MC_early_sigma_LB
+        ci_ub: MC_early_sigma_UB
+      Std:
+        mc_value: MC_Std
+        lib_value: Lib_Std
+        dif: Std_abs_err
+        rel: Std_rel_err
+        ci_lb: MC_Std_LB
+        ci_ub: MC_Std_UB
+      Skew:
+        mc_value: MC_Skew
+        lib_value: Lib_Skew
+        dif: Skew_abs_err
+        rel: Skew_rel_err
+        ci_lb: MC_Skew_LB
+        ci_ub: MC_Skew_UB
+      Meanshift:
+        mc_value: MC_Meanshift
+        lib_value: Lib_Meanshift
+        dif: Meanshift_abs_err
+        rel: Meanshift_rel_err
+        ci_lb: MC_Meanshift_LB
+        ci_ub: MC_Meanshift_UB
+      Nominal:
+        mc_value: MC_Nominal
+        lib_value: Lib_Nominal
+        dif: Nominal_abs_err
+        rel: Nominal_rel_err
+        ci_lb:
+        ci_ub:
+
+metric_availability_rules:
+  skip_metric_if_not_allowed_for_analysis_type: true
+  skip_metric_if_source_columns_missing: true
+  do_not_error_on_disallowed_hold_metrics: true
