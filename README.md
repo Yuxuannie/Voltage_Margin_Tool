@@ -265,12 +265,19 @@ Do not edit Python constants for threshold tuning. Edit the policy YAML.
 
 ## GUI
 
-The Tkinter GUI is still present for the old workflow:
+The Tkinter GUI launches a Phase 1 workbench:
 
 ```bash
 python run_gui.py
 ```
 
-Phase 1 does not update the GUI. It does not expose normalized rows, per-pair
-sensitivity, per-object margin outputs, or the YAML policy/mapping controls.
-Those are CLI/core features for this phase.
+The workbench supports:
+
+- selecting input and output directories
+- selecting policy and column-mapping YAML files
+- choosing `delay`, `slew`, and `hold` analysis types
+- running the Phase 1 output package flow
+- browsing pass-rate, margin, sensitivity, warning, and trace tables
+- filtering margin rows by source, type, metric, corner, and status
+- selecting a margin row to inspect formula text and source `path:line`
+- opening source files, copying `path:line`, and showing the raw source row
