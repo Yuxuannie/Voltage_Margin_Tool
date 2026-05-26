@@ -173,20 +173,208 @@ def filter_margins(
     return filtered
 
 
-def enrich_margin_rows(margins: pd.DataFrame, sensitivity: pd.DataFrame) -> pd.DataFrame:
+def enrich_margin_rows(
+    margins: pd.DataFrame,
+    sensitivity: pd.DataFrame,
+    per_arc: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     if margins.empty or sensitivity.empty or "sensitivity_trace_id" not in margins.columns:
-        return margins.copy()
-    enrich_columns = [
-        "sensitivity_trace_id",
-        "low_source_refs_summary",
-        "high_source_refs_summary",
-        "sensitivity_formula",
+        enriched = margins.copy()
+    else:
+        enrich_columns = [
+            "sensitivity_trace_id",
+            "low_source_refs_summary",
+            "high_source_refs_summary",
+            "sensitivity_formula",
+        ]
+        available = [column for column in enrich_columns if column in sensitivity.columns]
+        if available == ["sensitivity_trace_id"]:
+            enriched = margins.copy()
+        else:
+            lookup = sensitivity[available].drop_duplicates("sensitivity_trace_id")
+            enriched = margins.merge(lookup, on="sensitivity_trace_id", how="left")
+    if per_arc is None or per_arc.empty:
+        return enriched
+    join_cols = ["corner", "analysis_type", "metric", "arc"]
+    if not set(join_cols).issubset(enriched.columns) or not set(join_cols).issubset(per_arc.columns):
+        return enriched
+    per_arc_columns = join_cols + [
+        "rel_threshold",
+        "abs_threshold_ps",
+        "base_pass",
+        "ci_bounds_pass",
+        "mc_ci_lb_ps",
+        "mc_ci_ub_ps",
     ]
-    available = [column for column in enrich_columns if column in sensitivity.columns]
-    if available == ["sensitivity_trace_id"]:
-        return margins.copy()
-    lookup = sensitivity[available].drop_duplicates("sensitivity_trace_id")
-    return margins.merge(lookup, on="sensitivity_trace_id", how="left")
+    available = [column for column in per_arc_columns if column in per_arc.columns]
+    lookup = per_arc[available].drop_duplicates(join_cols)
+    return enriched.merge(lookup, on=join_cols, how="left", suffixes=("", "_pass_rate"))
+
+
+def _truthy(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    if pd.isna(value):
+        return False
+    return bool(value)
+
+
+def _finite(value):
+    numeric = pd.to_numeric(value, errors="coerce")
+    try:
+        return float(numeric) if math.isfinite(float(numeric)) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _base_pass(row) -> bool:
+    if "base_pass" in row and not pd.isna(row.get("base_pass")):
+        return _truthy(row.get("base_pass"))
+    return _passes_with_dif(row, _finite(row.get("dif_ps")))
+
+
+def _passes_with_dif(row, adjusted_dif) -> bool:
+    if adjusted_dif is None:
+        return False
+    mc_value = _finite(row.get("mc_value_ps"))
+    rel_threshold = _finite(row.get("rel_threshold"))
+    abs_threshold = _finite(row.get("abs_threshold_ps"))
+    rel_pass = False
+    abs_pass = False
+    if mc_value not in (None, 0.0) and rel_threshold is not None:
+        rel_pass = abs(adjusted_dif / abs(mc_value)) <= rel_threshold
+    if abs_threshold is not None:
+        abs_pass = abs(adjusted_dif) <= abs_threshold
+    ci_pass = _ci_pass(row, adjusted_dif)
+    return rel_pass or abs_pass or ci_pass
+
+
+def _ci_pass(row, adjusted_dif) -> bool:
+    mc_value = _finite(row.get("mc_value_ps"))
+    ci_lb = _finite(row.get("mc_ci_lb_ps"))
+    ci_ub = _finite(row.get("mc_ci_ub_ps"))
+    if mc_value is None or ci_lb is None or ci_ub is None:
+        return False
+    adjusted_lib = mc_value + adjusted_dif
+    lower = min(ci_lb, ci_ub)
+    upper = max(ci_lb, ci_ub)
+    return lower <= adjusted_lib <= upper
+
+
+def build_vm_sweep(
+    margins: pd.DataFrame,
+    max_margin_mv: int = 10,
+    step_mv: int = 1,
+    group_columns: Iterable[str] = ("compare_source", "corner", "analysis_type", "metric"),
+) -> pd.DataFrame:
+    group_columns = list(group_columns)
+    output_columns = [
+        "scope",
+        *group_columns,
+        "margin_mv",
+        "pass_count",
+        "total_count",
+        "base_pass_count",
+        "fixed_count",
+        "new_fail_count",
+        "pass_rate_pct",
+    ]
+    required = set(group_columns + ["dif_ps", "sensitivity_ps_per_mv"])
+    if margins.empty or not required.issubset(margins.columns):
+        return pd.DataFrame(columns=output_columns)
+
+    margin_points = list(range(0, int(max_margin_mv) + 1, int(step_mv)))
+    rows = []
+    for group_key, group in margins.groupby(group_columns, dropna=False):
+        group_values = dict(zip(group_columns, group_key if isinstance(group_key, tuple) else (group_key,)))
+        base_passes = group.apply(_base_pass, axis=1)
+        base_pass_count = int(base_passes.sum())
+        total = len(group)
+        for margin_mv in margin_points:
+            simulated = []
+            for idx, row in group.iterrows():
+                dif = _finite(row.get("dif_ps"))
+                sensitivity = _finite(row.get("sensitivity_ps_per_mv"))
+                adjusted_dif = dif
+                if dif is not None and sensitivity is not None:
+                    adjusted_dif = dif + margin_mv * sensitivity
+                simulated.append(_passes_with_dif(row, adjusted_dif))
+            simulated = pd.Series(simulated, index=group.index)
+            for scope in ["all_rows", "outliers_only"]:
+                if scope == "outliers_only":
+                    scoped_passes = base_passes | simulated
+                else:
+                    scoped_passes = simulated
+                pass_count = int(scoped_passes.sum())
+                fixed_count = int((~base_passes & scoped_passes).sum())
+                new_fail_count = int((base_passes & ~scoped_passes).sum())
+                rows.append(
+                    {
+                        "scope": scope,
+                        **group_values,
+                        "margin_mv": margin_mv,
+                        "pass_count": pass_count,
+                        "total_count": total,
+                        "base_pass_count": base_pass_count,
+                        "fixed_count": fixed_count,
+                        "new_fail_count": new_fail_count,
+                        "pass_rate_pct": round(pass_count / total * 100.0, 6) if total else 0.0,
+                    }
+                )
+    return pd.DataFrame(rows, columns=output_columns)
+
+
+def build_vm_target_summary(
+    sweep: pd.DataFrame,
+    target_pass_rate_pct: float = 95.0,
+) -> pd.DataFrame:
+    group_columns = ["scope", "compare_source", "corner", "analysis_type", "metric"]
+    output_columns = group_columns + [
+        "target_pass_rate_pct",
+        "base_pr_pct",
+        "required_vm_mv",
+        "pass_rate_at_required_vm_pct",
+        "fixed_count_at_required_vm",
+        "new_fail_count_at_required_vm",
+        "total_count",
+        "status",
+    ]
+    if sweep.empty or not set(group_columns).issubset(sweep.columns):
+        return pd.DataFrame(columns=output_columns)
+
+    rows = []
+    for group_key, group in sweep.groupby(group_columns, dropna=False):
+        ordered = group.sort_values("margin_mv", kind="mergesort")
+        base_rows = ordered[ordered["margin_mv"] == ordered["margin_mv"].min()]
+        base_pr = float(base_rows.iloc[0]["pass_rate_pct"]) if not base_rows.empty else 0.0
+        reaching = ordered[ordered["pass_rate_pct"] >= target_pass_rate_pct]
+        if reaching.empty:
+            selected = ordered.iloc[-1]
+            status = "not_reached"
+            required_vm = None
+        else:
+            selected = reaching.iloc[0]
+            status = "ok"
+            required_vm = selected["margin_mv"]
+        rows.append(
+            {
+                **dict(zip(group_columns, group_key if isinstance(group_key, tuple) else (group_key,))),
+                "target_pass_rate_pct": target_pass_rate_pct,
+                "base_pr_pct": base_pr,
+                "required_vm_mv": required_vm,
+                "pass_rate_at_required_vm_pct": float(selected["pass_rate_pct"]),
+                "fixed_count_at_required_vm": int(selected["fixed_count"]),
+                "new_fail_count_at_required_vm": int(selected["new_fail_count"]),
+                "total_count": int(selected["total_count"]),
+                "status": status,
+            }
+        )
+    return pd.DataFrame(rows, columns=output_columns).sort_values(
+        ["status", "required_vm_mv", "base_pr_pct"],
+        ascending=[True, True, True],
+        kind="mergesort",
+        na_position="last",
+    ).reset_index(drop=True)
 
 
 def build_target_margin_plan(

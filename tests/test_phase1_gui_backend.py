@@ -5,6 +5,8 @@ import pandas as pd
 from voltage_margin.gui.phase1_backend import (
     Phase1RunConfig,
     build_target_margin_plan,
+    build_vm_sweep,
+    build_vm_target_summary,
     enrich_margin_rows,
     filter_margins,
     format_margin_trace_detail,
@@ -176,6 +178,120 @@ def test_build_target_margin_plan_answers_95_percent_by_corner_and_type():
     assert delay["coverage_pct"] == 100.0
     assert delay["worst_metric"] == "Nominal"
     assert delay["worst_margin_trace_id"] == "m3"
+
+
+def test_build_vm_sweep_models_all_rows_and_outliers_only_scopes():
+    margins = pd.DataFrame(
+        [
+            {
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Meanshift",
+                "arc": "optimistic_big",
+                "mc_value_ps": 100.0,
+                "dif_ps": -3.0,
+                "sensitivity_ps_per_mv": 1.0,
+                "abs_threshold_ps": 1.0,
+                "rel_threshold": 0.01,
+                "base_pass": False,
+            },
+            {
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Meanshift",
+                "arc": "optimistic_small",
+                "mc_value_ps": 100.0,
+                "dif_ps": -2.0,
+                "sensitivity_ps_per_mv": 1.0,
+                "abs_threshold_ps": 1.0,
+                "rel_threshold": 0.01,
+                "base_pass": False,
+            },
+            {
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Meanshift",
+                "arc": "pessimistic_pass",
+                "mc_value_ps": 100.0,
+                "dif_ps": 0.5,
+                "sensitivity_ps_per_mv": 1.0,
+                "abs_threshold_ps": 1.0,
+                "rel_threshold": 0.01,
+                "base_pass": True,
+            },
+        ]
+    )
+
+    sweep = build_vm_sweep(margins, max_margin_mv=2, step_mv=1)
+
+    outlier_2mv = sweep[
+        (sweep["scope"] == "outliers_only") & (sweep["margin_mv"] == 2)
+    ].iloc[0]
+    all_2mv = sweep[(sweep["scope"] == "all_rows") & (sweep["margin_mv"] == 2)].iloc[0]
+
+    assert outlier_2mv["pass_rate_pct"] == 100.0
+    assert outlier_2mv["fixed_count"] == 2
+    assert outlier_2mv["new_fail_count"] == 0
+    assert all_2mv["pass_rate_pct"] == 66.666667
+    assert all_2mv["fixed_count"] == 2
+    assert all_2mv["new_fail_count"] == 1
+
+
+def test_build_vm_target_summary_finds_first_margin_reaching_target():
+    sweep = pd.DataFrame(
+        [
+            {
+                "scope": "outliers_only",
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Meanshift",
+                "margin_mv": 0,
+                "pass_rate_pct": 82.2,
+                "pass_count": 822,
+                "total_count": 1000,
+                "fixed_count": 0,
+                "new_fail_count": 0,
+            },
+            {
+                "scope": "outliers_only",
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Meanshift",
+                "margin_mv": 1,
+                "pass_rate_pct": 87.6,
+                "pass_count": 876,
+                "total_count": 1000,
+                "fixed_count": 54,
+                "new_fail_count": 0,
+            },
+            {
+                "scope": "outliers_only",
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Meanshift",
+                "margin_mv": 2,
+                "pass_rate_pct": 95.4,
+                "pass_count": 954,
+                "total_count": 1000,
+                "fixed_count": 132,
+                "new_fail_count": 0,
+            },
+        ]
+    )
+
+    summary = build_vm_target_summary(sweep, target_pass_rate_pct=95.0)
+
+    row = summary.iloc[0]
+    assert row["required_vm_mv"] == 2
+    assert row["target_pass_rate_pct"] == 95.0
+    assert row["pass_rate_at_required_vm_pct"] == 95.4
+    assert row["base_pr_pct"] == 82.2
 
 
 def test_enrich_margin_rows_adds_sensitivity_sources_for_audit():

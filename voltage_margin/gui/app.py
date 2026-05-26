@@ -16,7 +16,8 @@ from ..core.config_loader import DEFAULT_COLUMN_MAPPING, DEFAULT_POLICY
 from .phase1_backend import (
     OutputTables,
     Phase1RunConfig,
-    build_target_margin_plan,
+    build_vm_sweep,
+    build_vm_target_summary,
     enrich_margin_rows,
     filter_margins,
     format_margin_trace_detail,
@@ -33,21 +34,32 @@ logger = logging.getLogger(__name__)
 
 
 TARGET_COLUMNS = [
+    "scope",
     "compare_source",
     "corner",
     "analysis_type",
-    "required_margin_mv",
-    "target_coverage_pct",
-    "coverage_pct",
-    "covered_rows",
-    "valid_rows",
-    "skipped_rows",
-    "worst_margin_mv",
-    "worst_metric",
-    "worst_arc",
-    "worst_source_file_relative",
-    "worst_source_line_number",
-    "worst_margin_trace_id",
+    "metric",
+    "base_pr_pct",
+    "required_vm_mv",
+    "pass_rate_at_required_vm_pct",
+    "fixed_count_at_required_vm",
+    "new_fail_count_at_required_vm",
+    "total_count",
+    "status",
+]
+
+VM_SWEEP_COLUMNS = [
+    "scope",
+    "compare_source",
+    "corner",
+    "analysis_type",
+    "metric",
+    "margin_mv",
+    "pass_rate_pct",
+    "pass_count",
+    "total_count",
+    "fixed_count",
+    "new_fail_count",
 ]
 
 PASS_RATE_COLUMNS = [
@@ -154,6 +166,7 @@ class VoltageMarginApp:
         self.selected_margin_detail = {}
         self.tables: OutputTables | None = None
         self.margin_rows = pd.DataFrame()
+        self.vm_sweep = pd.DataFrame()
         self.target_plan = pd.DataFrame()
         self.display_frames = {}
         self.display_trees = {}
@@ -307,7 +320,7 @@ class VoltageMarginApp:
     def _build_notebook(self, parent):
         self.notebook = ttk.Notebook(parent)
         self.notebook.pack(fill="both", expand=True)
-        for name in ["95% Target", "Margins", "Pass Rate", "Sensitivity", "Warnings", "Trace"]:
+        for name in ["95% Target", "VM Sweep", "Margins", "Pass Rate", "Sensitivity", "Warnings", "Trace"]:
             frame = ttk.Frame(self.notebook, style="Panel.TFrame")
             self.notebook.add(frame, text=name)
             self._build_table_tab(name, frame)
@@ -432,8 +445,9 @@ class VoltageMarginApp:
             )
             self.tables = load_output_package(result.output_dir)
             self.margin_rows = enrich_margin_rows(
-                self.tables.all_margins, self.tables.sensitivity)
-            self.target_plan = build_target_margin_plan(self.margin_rows)
+                self.tables.all_margins, self.tables.sensitivity, self.tables.per_arc)
+            self.vm_sweep = build_vm_sweep(self.margin_rows, max_margin_mv=50, step_mv=1)
+            self.target_plan = build_vm_target_summary(self.vm_sweep)
             self.summary_var.set(
                 f"{result.parameter_groups} groups, {result.total_arcs} arcs")
             self._refresh_all_tables()
@@ -451,6 +465,7 @@ class VoltageMarginApp:
         if self.tables is None:
             return
         self._populate_table("95% Target", self.target_plan, TARGET_COLUMNS)
+        self._populate_table("VM Sweep", self.vm_sweep, VM_SWEEP_COLUMNS)
         self._populate_table("Pass Rate", self.tables.pass_rate, PASS_RATE_COLUMNS)
         self._apply_margin_filters()
         self._populate_table("Sensitivity", self.tables.sensitivity, SENSITIVITY_COLUMNS)
@@ -514,14 +529,16 @@ class VoltageMarginApp:
             status=self.filter_vars["status"].get(),
         )
         self._populate_table("Margins", filtered, MARGIN_COLUMNS)
+        filtered_sweep = build_vm_sweep(filtered, max_margin_mv=50, step_mv=1)
         self._populate_table(
             "95% Target",
-            build_target_margin_plan(filtered),
+            build_vm_target_summary(filtered_sweep),
             TARGET_COLUMNS,
         )
+        self._populate_table("VM Sweep", filtered_sweep, VM_SWEEP_COLUMNS)
         if self.current_tab_name == "Margins":
             self._select_first_margin()
-        if self.current_tab_name in {"95% Target", "Plots"}:
+        if self.current_tab_name in {"95% Target", "VM Sweep", "Plots"}:
             self._update_plot()
 
     def _populate_table(self, name, df, preferred_columns):
@@ -652,28 +669,25 @@ class VoltageMarginApp:
         self._write_trace_text(text)
 
     def _show_target_detail(self, row):
-        trace_id = str(row.get("worst_margin_trace_id", "") or "")
-        if trace_id and not self.margin_rows.empty and "margin_trace_id" in self.margin_rows.columns:
-            match = self.margin_rows[self.margin_rows["margin_trace_id"].astype(str) == trace_id]
-            if not match.empty:
-                self._show_margin_detail(match.iloc[0])
-                self.trace_title_var.set(
-                    f"95% target driver: {row.get('corner')} / {row.get('analysis_type')}"
-                )
-                return
         self.trace_title_var.set(
-            f"95% target: {row.get('corner')} / {row.get('analysis_type')}")
+            f"VM target: {row.get('corner')} / {row.get('analysis_type')} / {row.get('metric')}")
         self.path_line_var.set("")
         self.selected_margin_detail = {}
+        required_vm = row.get("required_vm_mv")
+        required_text = "not reached" if pd.isna(required_vm) else f"{required_vm:.0f} mV"
         self._write_trace_text(
             "\n".join(
                 [
-                    f"Required margin for {row.get('target_coverage_pct'):.0f}%: "
-                    f"{row.get('required_margin_mv'):.6g} mV",
-                    f"Coverage: {row.get('covered_rows')} / {row.get('valid_rows')} rows",
-                    f"Worst row: {row.get('worst_margin_mv'):.6g} mV",
-                    f"Worst metric: {row.get('worst_metric')}",
-                    f"Worst arc: {row.get('worst_arc')}",
+                    f"Scope: {row.get('scope')}",
+                    f"Base PR: {row.get('base_pr_pct'):.3g}%",
+                    f"Required VM to reach 95% PR: {required_text}",
+                    f"PR at required VM: {row.get('pass_rate_at_required_vm_pct'):.3g}%",
+                    f"Fixed outliers at required VM: {row.get('fixed_count_at_required_vm')}",
+                    f"New fails at required VM: {row.get('new_fail_count_at_required_vm')}",
+                    "",
+                    "Scope meaning:",
+                    "all_rows applies VM to every row, so pessimistic rows can become new fails.",
+                    "outliers_only applies VM only to base failing rows and holds base passing rows fixed.",
                 ]
             )
         )
@@ -743,7 +757,7 @@ class VoltageMarginApp:
             return
         plt.close(self.current_fig)
         target_df = self.display_dfs.get("95% Target", self.target_plan)
-        self.current_fig = self._plot_target_margin_plan(target_df)
+        self.current_fig = self._plot_vm_target(target_df)
         self.canvas.get_tk_widget().destroy()
         self.toolbar.destroy()
         parent = self.notebook.nametowidget(self.notebook.tabs()[-1])
@@ -755,34 +769,45 @@ class VoltageMarginApp:
         self.toolbar.update()
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
-    def _plot_target_margin_plan(self, plan):
+    def _plot_vm_target(self, plan):
         fig, ax = plt.subplots(figsize=(12, 6))
         fig.patch.set_facecolor("#f8fafb")
         ax.set_facecolor("#ffffff")
         if plan is None or plan.empty:
-            ax.text(0.5, 0.5, "Run analysis to see 95% margin plan",
+            ax.text(0.5, 0.5, "Run analysis to see VM sweep pass-rate simulation",
                     ha="center", va="center", fontsize=13, color="#66717d")
             ax.axis("off")
             return fig
-        plot_df = plan.sort_values("required_margin_mv", ascending=True).tail(24)
+        plot_df = plan[plan["scope"].astype(str) == "all_rows"].copy()
+        if plot_df.empty:
+            plot_df = plan.copy()
+        plot_df = plot_df.sort_values(
+            ["required_vm_mv", "base_pr_pct"],
+            ascending=[False, True],
+            na_position="first",
+        ).head(24)
+        plot_df = plot_df.sort_values("required_vm_mv", ascending=True, na_position="first")
         labels = plot_df.apply(
-            lambda r: f"{r['corner']} / {r['analysis_type']} / {r['compare_source']}",
+            lambda r: f"{r['corner']} / {r['analysis_type']} / {r['metric']}",
             axis=1,
         )
-        colors = ["#0b63ce" if value < 50 else "#c2410c"
-                  for value in plot_df["required_margin_mv"]]
-        bars = ax.barh(labels, plot_df["required_margin_mv"], color=colors, alpha=0.88)
-        for bar, value in zip(bars, plot_df["required_margin_mv"]):
+        values = pd.to_numeric(plot_df["required_vm_mv"], errors="coerce").fillna(50)
+        colors = ["#c2410c" if status == "not_reached" else "#0b63ce"
+                  for status in plot_df["status"]]
+        bars = ax.barh(labels, values, color=colors, alpha=0.88)
+        max_value = max(float(values.max()), 1.0)
+        for bar, value, status in zip(bars, values, plot_df["status"]):
+            label = ">50 mV" if status == "not_reached" else f"{value:.0f} mV"
             ax.text(
-                bar.get_width() + max(plot_df["required_margin_mv"].max() * 0.01, 0.2),
+                bar.get_width() + max(max_value * 0.01, 0.2),
                 bar.get_y() + bar.get_height() / 2,
-                f"{value:.2f} mV",
+                label,
                 va="center",
                 fontsize=8,
                 color="#17212b",
             )
-        ax.set_xlabel("Voltage margin required for >=95% coverage (mV)")
-        ax.set_title("95% Voltage Margin Requirement by Corner and Type")
+        ax.set_xlabel("VM required for pass rate >=95% (mV)")
+        ax.set_title("All Rows VM Sweep: Minimum VM to Reach 95% Pass Rate")
         ax.grid(axis="x", alpha=0.25)
         ax.spines[["top", "right", "left"]].set_visible(False)
         fig.tight_layout()
