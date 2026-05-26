@@ -21,6 +21,7 @@ from .phase1_backend import (
     load_output_package,
     read_source_line,
     run_phase1_pipeline,
+    summarize_margins,
     table_columns,
     unique_values,
 )
@@ -122,7 +123,13 @@ class VoltageMarginApp:
         self.summary_var = tk.StringVar(value="No run loaded.")
         self.trace_title_var = tk.StringVar(value="Select a margin row to inspect trace.")
         self.path_line_var = tk.StringVar(value="")
-        self.current_tab_name = "Pass Rate"
+        self.current_tab_name = "Margins"
+        self.kpi_vars = {
+            "margins": tk.StringVar(value="0"),
+            "ok": tk.StringVar(value="0"),
+            "review": tk.StringVar(value="0"),
+            "trace": tk.StringVar(value="0"),
+        }
         self.selected_margin_detail = {}
         self.tables: OutputTables | None = None
         self.display_frames = {}
@@ -144,6 +151,14 @@ class VoltageMarginApp:
         style.configure("Muted.TLabel", background="#edf1f4", foreground="#5b6773")
         style.configure("Title.TLabel", background="#edf1f4", foreground="#0f1720",
                         font=("Helvetica", 18, "bold"))
+        style.configure("Hero.TLabel", background="#edf1f4", foreground="#16202a",
+                        font=("Helvetica", 11))
+        style.configure("Kpi.TFrame", background="#f8fafb", relief="solid", borderwidth=1)
+        style.configure("KpiValue.TLabel", background="#f8fafb", foreground="#0f1720",
+                        font=("Helvetica", 19, "bold"))
+        style.configure("KpiLabel.TLabel", background="#f8fafb", foreground="#5b6773",
+                        font=("Helvetica", 9))
+        style.configure("Link.TLabel", background="#f8fafb", foreground="#0b63ce")
         style.configure("Card.TLabelframe", background="#f8fafb", bordercolor="#cfd7df")
         style.configure("Card.TLabelframe.Label", background="#f8fafb",
                         foreground="#223142", font=("Helvetica", 10, "bold"))
@@ -163,14 +178,16 @@ class VoltageMarginApp:
         ttk.Label(header, text="Voltage Margin Tool", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="Phase 1 workbench: run analysis, inspect margins, and trace every value to source.",
-            style="Muted.TLabel",
+            text="Traceable Phase 1 workbench for voltage margin, sensitivity, and source-line review.",
+            style="Hero.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
         controls = ttk.LabelFrame(self.root, text="Run Configuration", style="Card.TLabelframe",
                                   padding=10)
         controls.pack(fill="x", padx=12, pady=(4, 8))
         self._build_controls(controls)
+
+        self._build_kpis()
 
         body = ttk.PanedWindow(self.root, orient="horizontal")
         body.pack(fill="both", expand=True, padx=12, pady=(0, 8))
@@ -194,6 +211,23 @@ class VoltageMarginApp:
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief="sunken",
                                anchor="w", padding=(8, 3))
         status_bar.pack(fill="x", padx=12, pady=(0, 10))
+
+    def _build_kpis(self):
+        kpi_bar = ttk.Frame(self.root, padding=(12, 0, 12, 8))
+        kpi_bar.pack(fill="x")
+        specs = [
+            ("Voltage Margin Rows", "margins"),
+            ("OK Margins", "ok"),
+            ("Need Review", "review"),
+            ("Trace Links", "trace"),
+        ]
+        for idx, (label, key) in enumerate(specs):
+            card = ttk.Frame(kpi_bar, style="Kpi.TFrame", padding=(14, 8))
+            card.grid(row=0, column=idx, sticky="ew", padx=(0 if idx == 0 else 8, 0))
+            kpi_bar.columnconfigure(idx, weight=1)
+            ttk.Label(card, textvariable=self.kpi_vars[key], style="KpiValue.TLabel").pack(
+                anchor="w")
+            ttk.Label(card, text=label, style="KpiLabel.TLabel").pack(anchor="w")
 
     def _build_controls(self, parent):
         parent.columnconfigure(1, weight=1)
@@ -250,7 +284,6 @@ class VoltageMarginApp:
     def _build_notebook(self, parent):
         self.notebook = ttk.Notebook(parent)
         self.notebook.pack(fill="both", expand=True)
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         for name in ["Pass Rate", "Margins", "Sensitivity", "Warnings", "Trace"]:
             frame = ttk.Frame(self.notebook, style="Panel.TFrame")
             self.notebook.add(frame, text=name)
@@ -259,6 +292,8 @@ class VoltageMarginApp:
         plot_frame = ttk.Frame(self.notebook, style="Panel.TFrame")
         self.notebook.add(plot_frame, text="Plots")
         self._build_plot_tab(plot_frame)
+        self.notebook.select(1)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _build_table_tab(self, name, frame):
         frame.rowconfigure(0, weight=1)
@@ -267,6 +302,9 @@ class VoltageMarginApp:
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.tag_configure("ok", background="#ffffff")
+        tree.tag_configure("review", background="#fff7e6")
+        tree.tag_configure("missing", background="#f3f6f9")
         tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
@@ -298,8 +336,20 @@ class VoltageMarginApp:
             side="right", padx=(6, 0))
         ttk.Button(top, text="Show Raw Row", command=self._show_raw_row).pack(side="right")
 
-        ttk.Label(parent, textvariable=self.path_line_var, style="Muted.TLabel").pack(
-            fill="x", pady=(4, 6))
+        self.path_line_value = ttk.Label(
+            parent,
+            textvariable=self.path_line_var,
+            style="Link.TLabel",
+            cursor="hand2",
+        )
+        self.path_line_value.pack(fill="x", pady=(4, 0))
+        self.path_line_value.bind("<Button-1>", lambda _event: self._open_source_file())
+        self.path_line_hint = ttk.Label(
+            parent,
+            text="Click the path or use Open Source to verify the row in the original report.",
+            style="Muted.TLabel",
+        )
+        self.path_line_hint.pack(fill="x", pady=(0, 6))
         self.trace_text = tk.Text(parent, height=7, wrap="word", bd=0,
                                   bg="#ffffff", fg="#17212b", relief="flat")
         self.trace_text.pack(fill="both", expand=True)
@@ -359,6 +409,8 @@ class VoltageMarginApp:
                 f"{result.parameter_groups} groups, {result.total_arcs} arcs")
             self._refresh_all_tables()
             self._refresh_filter_options()
+            self._refresh_kpis()
+            self._show_margin_workspace()
             self._update_plot()
             self.status_var.set(f"Analysis complete. Output: {result.output_dir}")
         except Exception as exc:
@@ -374,6 +426,15 @@ class VoltageMarginApp:
         self._populate_table("Sensitivity", self.tables.sensitivity, SENSITIVITY_COLUMNS)
         self._populate_table("Warnings", self._combined_warnings(), WARNING_COLUMNS)
         self._populate_table("Trace", self.tables.margin_trace, TRACE_COLUMNS)
+
+    def _refresh_kpis(self):
+        if self.tables is None:
+            return
+        summary = summarize_margins(self.tables.all_margins, self.tables.margin_trace)
+        self.kpi_vars["margins"].set(str(summary.total_margins))
+        self.kpi_vars["ok"].set(str(summary.ok_margins))
+        self.kpi_vars["review"].set(str(summary.needs_review))
+        self.kpi_vars["trace"].set(str(summary.trace_rows))
 
     def _combined_warnings(self):
         if self.tables is None:
@@ -423,6 +484,8 @@ class VoltageMarginApp:
             status=self.filter_vars["status"].get(),
         )
         self._populate_table("Margins", filtered, MARGIN_COLUMNS)
+        if self.current_tab_name == "Margins":
+            self._select_first_margin()
 
     def _populate_table(self, name, df, preferred_columns):
         tree = self.display_trees[name]
@@ -440,7 +503,18 @@ class VoltageMarginApp:
         self.display_dfs[name] = display_df
         for idx, row in display_df.iterrows():
             values = [self._format_cell(row.get(column, "")) for column in columns]
-            tree.insert("", "end", iid=str(idx), values=values)
+            tags = self._row_tags(name, row)
+            tree.insert("", "end", iid=str(idx), values=values, tags=tags)
+
+    def _row_tags(self, name, row):
+        if name != "Margins":
+            return ()
+        status = str(row.get("margin_status", "") or "")
+        if status == "ok":
+            return ("ok",)
+        if status:
+            return ("review",)
+        return ("missing",)
 
     def _format_cell(self, value):
         if pd.isna(value):
@@ -471,6 +545,29 @@ class VoltageMarginApp:
         row = self.display_dfs[tab_name].iloc[int(selected[0])]
         self._show_margin_detail(row)
 
+    def _show_margin_workspace(self):
+        self.notebook.select(1)
+        self.current_tab_name = "Margins"
+        self._select_first_margin()
+
+    def _select_first_margin(self):
+        tree = self.display_trees.get("Margins")
+        if tree is None:
+            return
+        children = tree.get_children()
+        if not children:
+            self.trace_title_var.set("No margin rows available for current filters.")
+            self.path_line_var.set("")
+            self.selected_margin_detail = {}
+            self._write_trace_text("No voltage margin rows match the current filters.")
+            return
+        first = children[0]
+        tree.selection_set(first)
+        tree.focus(first)
+        tree.see(first)
+        row = self.display_dfs["Margins"].iloc[int(first)]
+        self._show_margin_detail(row)
+
     def _show_margin_detail(self, row):
         detail = format_margin_trace_detail(row)
         self.selected_margin_detail = detail
@@ -486,6 +583,12 @@ class VoltageMarginApp:
                 f"High sources: {detail['high_sources']}",
             ]
         )
+        self.trace_text.configure(state="normal")
+        self.trace_text.delete("1.0", "end")
+        self.trace_text.insert("1.0", text)
+        self.trace_text.configure(state="disabled")
+
+    def _write_trace_text(self, text):
         self.trace_text.configure(state="normal")
         self.trace_text.delete("1.0", "end")
         self.trace_text.insert("1.0", text)

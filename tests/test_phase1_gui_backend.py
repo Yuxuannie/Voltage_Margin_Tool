@@ -9,6 +9,7 @@ from voltage_margin.gui.phase1_backend import (
     load_output_package,
     read_source_line,
     run_phase1_pipeline,
+    summarize_margins,
 )
 
 
@@ -115,6 +116,24 @@ def test_filter_margins_filters_by_user_visible_fields():
 
     assert len(filtered) == 1
     assert filtered.iloc[0]["compare_source"] == "fmc_compare"
+
+
+def test_summarize_margins_counts_status_and_trace_rows():
+    margins = pd.DataFrame(
+        [
+            {"margin_status": "ok"},
+            {"margin_status": "ok"},
+            {"margin_status": "skipped_no_sensitivity"},
+        ]
+    )
+    trace = pd.DataFrame([{"margin_trace_id": "m-1"}, {"margin_trace_id": "m-2"}])
+
+    summary = summarize_margins(margins, trace)
+
+    assert summary.total_margins == 3
+    assert summary.ok_margins == 2
+    assert summary.needs_review == 1
+    assert summary.trace_rows == 2
 
 
 def test_margin_trace_detail_and_source_line_lookup(tmp_path):

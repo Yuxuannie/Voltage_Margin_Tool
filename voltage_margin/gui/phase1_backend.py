@@ -57,6 +57,14 @@ class OutputTables:
     margin_trace: pd.DataFrame
 
 
+@dataclass
+class MarginSummary:
+    total_margins: int = 0
+    ok_margins: int = 0
+    needs_review: int = 0
+    trace_rows: int = 0
+
+
 def run_phase1_pipeline(config: Phase1RunConfig) -> Phase1RunResult:
     data_dir = Path(config.data_dir)
     output_dir = Path(config.output_dir)
@@ -157,6 +165,19 @@ def filter_margins(
         if value and value != "All" and column in filtered.columns:
             filtered = filtered[filtered[column].astype(str) == str(value)]
     return filtered
+
+
+def summarize_margins(margins: pd.DataFrame, margin_trace: pd.DataFrame) -> MarginSummary:
+    if margins.empty:
+        return MarginSummary(trace_rows=len(margin_trace))
+    status = margins["margin_status"].astype(str) if "margin_status" in margins.columns else ""
+    ok = int((status == "ok").sum()) if "margin_status" in margins.columns else 0
+    return MarginSummary(
+        total_margins=len(margins),
+        ok_margins=ok,
+        needs_review=len(margins) - ok,
+        trace_rows=len(margin_trace),
+    )
 
 
 def format_margin_trace_detail(row: pd.Series) -> dict[str, str]:
