@@ -16,6 +16,7 @@ __pycache__/
 .vscode/
 .idea/
 *.swp
+.superpowers/
 
 # OS files
 .DS_Store

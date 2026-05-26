@@ -167,6 +167,7 @@ def _write_phase1_outputs(
     _write_margin_set(output_dir / 'optimistic_only', margin_outputs.optimistic_only_per_object,
                       margin_outputs.optimistic_only_summary, margin_outputs.optimistic_only_curve,
                       margin_outputs.optimistic_only_high_margin)
+    _write_trace_outputs(output_dir / 'trace', normalized_df, sensitivity_df, margin_outputs)
 
 
 def _write_margin_set(directory, per_object, summary, curve, high_margin):
@@ -174,6 +175,34 @@ def _write_margin_set(directory, per_object, summary, curve, high_margin):
     _write_csv(summary, directory / 'margin_summary.csv')
     _write_csv(curve, directory / 'margin_efficiency_curve.csv')
     _write_csv(high_margin, directory / 'high_margin_objects.csv')
+
+
+def _write_trace_outputs(directory, normalized_df, sensitivity_df, margin_outputs):
+    source_trace_columns = [
+        'trace_id',
+        'input_root',
+        'source_file',
+        'source_file_relative',
+        'source_line_number',
+        'source_row_index',
+        'source_mc_column',
+        'source_lib_column',
+        'source_dif_column',
+        'source_rel_column',
+        'compare_source',
+        'process',
+        'process_version',
+        'corner',
+        'analysis_type',
+        'metric',
+        'arc',
+    ]
+    source_columns = [col for col in source_trace_columns if col in normalized_df.columns]
+    _write_csv(normalized_df[source_columns].copy(), directory / 'source_rows.csv')
+
+    sensitivity_source_refs = sensitivity_df.attrs.get('source_refs', pd.DataFrame())
+    _write_csv(sensitivity_source_refs, directory / 'sensitivity_source_refs.csv')
+    _write_csv(margin_outputs.margin_trace, directory / 'margin_trace.csv')
 
 
 def _arc_results_to_dataframe(results, normalized_df, policy):

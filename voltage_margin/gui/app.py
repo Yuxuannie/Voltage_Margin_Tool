@@ -1,391 +1,675 @@
-"""
-Main GUI application for Voltage Margin Analysis Tool.
+"""Tkinter Phase 1 workbench for Voltage Margin Tool."""
 
-Uses Tkinter with embedded matplotlib for interactive analysis.
-"""
-
-import os
 import logging
+import os
+import webbrowser
+from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import pandas as pd
+from tkinter import filedialog, messagebox, ttk
 
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import matplotlib.pyplot as plt
+import pandas as pd
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
-from ..core.data_loader import load_all_data, auto_discover_files
-from ..core.pass_rate_engine import (
-    run_full_analysis, results_to_dataframe, filter_results_by_waivers,
-)
-from ..visualization.plots import (
-    plot_pass_rate_bars, plot_pass_rate_heatmap,
-    plot_error_distribution, plot_margin_efficiency,
+from ..core.config_loader import DEFAULT_COLUMN_MAPPING, DEFAULT_POLICY
+from ..visualization.plots import plot_pass_rate_bars
+from .phase1_backend import (
+    OutputTables,
+    Phase1RunConfig,
+    filter_margins,
+    format_margin_trace_detail,
+    load_output_package,
+    read_source_line,
+    run_phase1_pipeline,
+    summarize_margins,
+    table_columns,
+    unique_values,
 )
 
 logger = logging.getLogger(__name__)
 
 
+PASS_RATE_COLUMNS = [
+    "Corner",
+    "Type",
+    "Parameter",
+    "Total_Arcs",
+    "Base_PR",
+    "PR_with_Waiver1",
+    "PR_Optimistic_Only",
+    "PR_with_Both_Waivers",
+]
+
+MARGIN_COLUMNS = [
+    "compare_source",
+    "corner",
+    "analysis_type",
+    "metric",
+    "arc",
+    "dif_ps",
+    "sensitivity_ps_per_mv",
+    "required_margin_mv",
+    "margin_status",
+    "source_file_relative",
+    "source_line_number",
+    "margin_trace_id",
+]
+
+SENSITIVITY_COLUMNS = [
+    "compare_source",
+    "corner",
+    "analysis_type",
+    "metric",
+    "arc",
+    "pair_role",
+    "low_voltage_v",
+    "high_voltage_v",
+    "low_lib_value_ps",
+    "high_lib_value_ps",
+    "sensitivity_ps_per_mv",
+    "sensitivity_trace_id",
+]
+
+WARNING_COLUMNS = [
+    "warning_source",
+    "file_path",
+    "corner",
+    "analysis_type",
+    "metric",
+    "arc",
+    "warning_code",
+    "warning_message",
+]
+
+TRACE_COLUMNS = [
+    "margin_trace_id",
+    "normalized_trace_id",
+    "sensitivity_trace_id",
+    "source_file_relative",
+    "source_line_number",
+    "dif_ps",
+    "sensitivity_ps_per_mv",
+    "required_margin_mv",
+    "margin_formula_id",
+]
+
+
 class VoltageMarginApp:
-    """Main GUI application."""
+    """Main Phase 1 workbench application."""
 
     def __init__(self, root):
         self.root = root
-        self.root.title('Voltage Margin Analysis Tool')
-        self.root.geometry('1400x900')
-        self.root.minsize(1000, 700)
+        self.root.title("Voltage Margin Tool")
+        self.root.geometry("1540x960")
+        self.root.minsize(1180, 760)
 
-        # State
         self.data_dir = tk.StringVar()
-        self.bundles = {}
-        self.analysis_results = []
-        self.results_df = pd.DataFrame()
-        self.full_results_df = pd.DataFrame()  # unfiltered
+        self.output_dir = tk.StringVar()
+        self.policy_path = tk.StringVar(value=str(DEFAULT_POLICY))
+        self.column_map_path = tk.StringVar(value=str(DEFAULT_COLUMN_MAPPING))
+        self.type_vars = {
+            "delay": tk.BooleanVar(value=True),
+            "slew": tk.BooleanVar(value=True),
+            "hold": tk.BooleanVar(value=True),
+        }
+        self.filter_vars = {
+            "source": tk.StringVar(value="All"),
+            "type": tk.StringVar(value="All"),
+            "metric": tk.StringVar(value="All"),
+            "corner": tk.StringVar(value="All"),
+            "status": tk.StringVar(value="All"),
+        }
+        self.status_var = tk.StringVar(value="Ready. Select input and output folders.")
+        self.summary_var = tk.StringVar(value="No run loaded.")
+        self.trace_title_var = tk.StringVar(value="Select a margin row to inspect trace.")
+        self.path_line_var = tk.StringVar(value="")
+        self.current_tab_name = "Margins"
+        self.kpi_vars = {
+            "margins": tk.StringVar(value="0"),
+            "ok": tk.StringVar(value="0"),
+            "review": tk.StringVar(value="0"),
+            "trace": tk.StringVar(value="0"),
+        }
+        self.selected_margin_detail = {}
+        self.tables: OutputTables | None = None
+        self.display_frames = {}
+        self.display_trees = {}
+        self.display_dfs = {}
 
-        # Waiver toggles
-        self.waiver1_var = tk.BooleanVar(value=True)
-        self.optimistic_var = tk.BooleanVar(value=True)
-
-        # Plot selector
-        self.plot_type_var = tk.StringVar(value='bar_chart')
-
-        # Heatmap PR column selector
-        self.heatmap_pr_var = tk.StringVar(value='Base_PR')
-
+        self._build_style()
         self._build_ui()
 
+    def _build_style(self):
+        self.root.configure(bg="#edf1f4")
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure(".", font=("Helvetica", 10), background="#edf1f4")
+        style.configure("TFrame", background="#edf1f4")
+        style.configure("Panel.TFrame", background="#f8fafb")
+        style.configure("TLabel", background="#edf1f4", foreground="#17212b")
+        style.configure("Muted.TLabel", background="#edf1f4", foreground="#5b6773")
+        style.configure("Title.TLabel", background="#edf1f4", foreground="#0f1720",
+                        font=("Helvetica", 18, "bold"))
+        style.configure("Hero.TLabel", background="#edf1f4", foreground="#16202a",
+                        font=("Helvetica", 11))
+        style.configure("Kpi.TFrame", background="#f8fafb", relief="solid", borderwidth=1)
+        style.configure("KpiValue.TLabel", background="#f8fafb", foreground="#0f1720",
+                        font=("Helvetica", 19, "bold"))
+        style.configure("KpiLabel.TLabel", background="#f8fafb", foreground="#5b6773",
+                        font=("Helvetica", 9))
+        style.configure("Link.TLabel", background="#f8fafb", foreground="#0b63ce")
+        style.configure("Card.TLabelframe", background="#f8fafb", bordercolor="#cfd7df")
+        style.configure("Card.TLabelframe.Label", background="#f8fafb",
+                        foreground="#223142", font=("Helvetica", 10, "bold"))
+        style.configure("Accent.TButton", background="#1f6feb", foreground="#ffffff",
+                        font=("Helvetica", 10, "bold"))
+        style.map("Accent.TButton", background=[("active", "#185abc")])
+        style.configure("Treeview", rowheight=24, background="#ffffff",
+                        fieldbackground="#ffffff", foreground="#16202a")
+        style.configure("Treeview.Heading", font=("Helvetica", 9, "bold"),
+                        background="#dfe7ef", foreground="#17212b")
+        style.configure("TNotebook", background="#edf1f4", borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(14, 7), font=("Helvetica", 10))
+
     def _build_ui(self):
-        """Build the complete UI layout."""
-        # --- Top: Control panel ---
-        control_frame = ttk.LabelFrame(self.root, text='Controls', padding=8)
-        control_frame.pack(fill='x', padx=8, pady=(8, 4))
-        self._build_control_panel(control_frame)
+        header = ttk.Frame(self.root, padding=(14, 12, 14, 6))
+        header.pack(fill="x")
+        ttk.Label(header, text="Voltage Margin Tool", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            header,
+            text="Traceable Phase 1 workbench for voltage margin, sensitivity, and source-line review.",
+            style="Hero.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
 
-        # --- Middle: PanedWindow with table + plot ---
-        paned = ttk.PanedWindow(self.root, orient='horizontal')
-        paned.pack(fill='both', expand=True, padx=8, pady=4)
+        controls = ttk.LabelFrame(self.root, text="Run Configuration", style="Card.TLabelframe",
+                                  padding=10)
+        controls.pack(fill="x", padx=12, pady=(4, 8))
+        self._build_controls(controls)
 
-        # Left: results table
-        table_frame = ttk.LabelFrame(paned, text='Pass Rate Results', padding=4)
-        paned.add(table_frame, weight=1)
-        self._build_table(table_frame)
+        self._build_kpis()
 
-        # Right: plot viewer
-        plot_frame = ttk.LabelFrame(paned, text='Plots', padding=4)
-        paned.add(plot_frame, weight=2)
-        self._build_plot_viewer(plot_frame)
+        body = ttk.PanedWindow(self.root, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 8))
 
-        # --- Bottom: status bar ---
-        self.status_var = tk.StringVar(value='Ready. Select a data directory to begin.')
-        status_bar = ttk.Label(self.root, textvariable=self.status_var,
-                               relief='sunken', anchor='w')
-        status_bar.pack(fill='x', padx=8, pady=(0, 8))
+        filters = ttk.LabelFrame(body, text="Filters", style="Card.TLabelframe", padding=10)
+        body.add(filters, weight=0)
+        self._build_filters(filters)
 
-    def _build_control_panel(self, parent):
-        """Input selection, waiver toggles, action buttons."""
-        # Row 1: directory selection
-        row1 = ttk.Frame(parent)
-        row1.pack(fill='x', pady=2)
+        right = ttk.PanedWindow(body, orient="vertical")
+        body.add(right, weight=1)
 
-        ttk.Label(row1, text='Data Directory:').pack(side='left')
-        ttk.Entry(row1, textvariable=self.data_dir, width=60).pack(
-            side='left', padx=4, fill='x', expand=True)
-        ttk.Button(row1, text='Browse...', command=self._browse_dir).pack(side='left')
-        ttk.Button(row1, text='Run Analysis', command=self._run_analysis,
-                   style='Accent.TButton').pack(side='left', padx=(12, 0))
+        work = ttk.Frame(right)
+        right.add(work, weight=4)
+        self._build_notebook(work)
 
-        # Row 2: waiver toggles + plot selector + export
-        row2 = ttk.Frame(parent)
-        row2.pack(fill='x', pady=2)
+        trace = ttk.LabelFrame(right, text="Selected Margin Trace", style="Card.TLabelframe",
+                               padding=10)
+        right.add(trace, weight=1)
+        self._build_trace_panel(trace)
 
-        ttk.Label(row2, text='Waivers:').pack(side='left')
-        ttk.Checkbutton(row2, text='CI Enlargement (6%)',
-                        variable=self.waiver1_var,
-                        command=self._on_waiver_toggle).pack(side='left', padx=4)
-        ttk.Checkbutton(row2, text='Optimistic Direction',
-                        variable=self.optimistic_var,
-                        command=self._on_waiver_toggle).pack(side='left', padx=4)
+        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief="sunken",
+                               anchor="w", padding=(8, 3))
+        status_bar.pack(fill="x", padx=12, pady=(0, 10))
 
-        ttk.Separator(row2, orient='vertical').pack(side='left', fill='y', padx=8)
+    def _build_kpis(self):
+        kpi_bar = ttk.Frame(self.root, padding=(12, 0, 12, 8))
+        kpi_bar.pack(fill="x")
+        specs = [
+            ("Voltage Margin Rows", "margins"),
+            ("OK Margins", "ok"),
+            ("Need Review", "review"),
+            ("Trace Links", "trace"),
+        ]
+        for idx, (label, key) in enumerate(specs):
+            card = ttk.Frame(kpi_bar, style="Kpi.TFrame", padding=(14, 8))
+            card.grid(row=0, column=idx, sticky="ew", padx=(0 if idx == 0 else 8, 0))
+            kpi_bar.columnconfigure(idx, weight=1)
+            ttk.Label(card, textvariable=self.kpi_vars[key], style="KpiValue.TLabel").pack(
+                anchor="w")
+            ttk.Label(card, text=label, style="KpiLabel.TLabel").pack(anchor="w")
 
-        ttk.Label(row2, text='Plot:').pack(side='left')
-        plot_combo = ttk.Combobox(row2, textvariable=self.plot_type_var,
-                                  values=['bar_chart', 'heatmap',
-                                          'error_distribution'],
-                                  state='readonly', width=18)
-        plot_combo.pack(side='left', padx=4)
-        plot_combo.bind('<<ComboboxSelected>>', lambda e: self._update_plot())
+    def _build_controls(self, parent):
+        parent.columnconfigure(1, weight=1)
+        parent.columnconfigure(4, weight=1)
+        self._path_row(parent, 0, "Input", self.data_dir, self._browse_data_dir)
+        self._path_row(parent, 1, "Output", self.output_dir, self._browse_output_dir)
+        self._path_row(parent, 2, "Policy", self.policy_path,
+                       lambda: self._browse_file(self.policy_path, "Select policy YAML"))
+        self._path_row(parent, 3, "Column Map", self.column_map_path,
+                       lambda: self._browse_file(self.column_map_path, "Select column map YAML"))
 
-        # Heatmap PR column selector
-        ttk.Label(row2, text='Heatmap PR:').pack(side='left', padx=(8, 0))
-        heatmap_combo = ttk.Combobox(
-            row2, textvariable=self.heatmap_pr_var,
-            values=['Base_PR', 'PR_with_Waiver1',
-                    'PR_Optimistic_Only', 'PR_with_Both_Waivers'],
-            state='readonly', width=20)
-        heatmap_combo.pack(side='left', padx=4)
-        heatmap_combo.bind('<<ComboboxSelected>>', lambda e: self._update_plot())
+        type_frame = ttk.Frame(parent)
+        type_frame.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        ttk.Label(type_frame, text="Types:").pack(side="left")
+        for type_name, var in self.type_vars.items():
+            ttk.Checkbutton(type_frame, text=type_name, variable=var).pack(
+                side="left", padx=(8, 0))
 
-        ttk.Separator(row2, orient='vertical').pack(side='left', fill='y', padx=8)
+        ttk.Button(type_frame, text="Run Phase 1", style="Accent.TButton",
+                   command=self._run_analysis).pack(side="left", padx=(20, 0))
+        ttk.Button(type_frame, text="Open Output", command=self._open_output_folder).pack(
+            side="left", padx=(8, 0))
+        ttk.Button(type_frame, text="Export Current Table", command=self._export_current_table).pack(
+            side="left", padx=(8, 0))
+        ttk.Button(type_frame, text="Save Plot", command=self._save_plot).pack(
+            side="left", padx=(8, 0))
+        ttk.Label(type_frame, textvariable=self.summary_var, style="Muted.TLabel").pack(
+            side="left", padx=(18, 0))
 
-        ttk.Button(row2, text='Export CSV', command=self._export_csv).pack(side='left')
-        ttk.Button(row2, text='Save Plot', command=self._save_plot).pack(
-            side='left', padx=4)
+    def _path_row(self, parent, row, label, variable, command):
+        ttk.Label(parent, text=f"{label}:").grid(row=row, column=0, sticky="w", pady=2)
+        entry = ttk.Entry(parent, textvariable=variable)
+        entry.grid(row=row, column=1, columnspan=3, sticky="ew", padx=6, pady=2)
+        ttk.Button(parent, text="Browse", command=command).grid(row=row, column=4, sticky="e")
 
-    def _build_table(self, parent):
-        """Sortable results table using Treeview."""
-        columns = ('Corner', 'Type', 'Parameter', 'Total_Arcs',
-                   'Base_PR', 'PR_with_Waiver1',
-                   'PR_Optimistic_Only', 'PR_with_Both_Waivers')
+    def _build_filters(self, parent):
+        filter_specs = [
+            ("Source", "source"),
+            ("Type", "type"),
+            ("Metric", "metric"),
+            ("Corner", "corner"),
+            ("Status", "status"),
+        ]
+        self.filter_boxes = {}
+        for label, key in filter_specs:
+            ttk.Label(parent, text=label).pack(anchor="w", pady=(0, 2))
+            box = ttk.Combobox(parent, textvariable=self.filter_vars[key],
+                               values=["All"], state="readonly", width=24)
+            box.pack(fill="x", pady=(0, 10))
+            box.bind("<<ComboboxSelected>>", lambda _event: self._apply_margin_filters())
+            self.filter_boxes[key] = box
+        ttk.Button(parent, text="Reset Filters", command=self._reset_filters).pack(fill="x")
 
-        self.tree = ttk.Treeview(parent, columns=columns, show='headings',
-                                 selectmode='browse')
+    def _build_notebook(self, parent):
+        self.notebook = ttk.Notebook(parent)
+        self.notebook.pack(fill="both", expand=True)
+        for name in ["Pass Rate", "Margins", "Sensitivity", "Warnings", "Trace"]:
+            frame = ttk.Frame(self.notebook, style="Panel.TFrame")
+            self.notebook.add(frame, text=name)
+            self._build_table_tab(name, frame)
 
-        col_widths = {
-            'Corner': 130, 'Type': 60, 'Parameter': 100, 'Total_Arcs': 70,
-            'Base_PR': 75, 'PR_with_Waiver1': 95,
-            'PR_Optimistic_Only': 95, 'PR_with_Both_Waivers': 95,
-        }
-        for col in columns:
-            self.tree.heading(col, text=col,
-                              command=lambda c=col: self._sort_table(c))
-            self.tree.column(col, width=col_widths.get(col, 80), anchor='center')
+        plot_frame = ttk.Frame(self.notebook, style="Panel.TFrame")
+        self.notebook.add(plot_frame, text="Plots")
+        self._build_plot_tab(plot_frame)
+        self.notebook.select(1)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-        # Scrollbars
-        vsb = ttk.Scrollbar(parent, orient='vertical', command=self.tree.yview)
-        hsb = ttk.Scrollbar(parent, orient='horizontal', command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    def _build_table_tab(self, name, frame):
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        tree = ttk.Treeview(frame, show="headings", selectmode="browse")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.tag_configure("ok", background="#ffffff")
+        tree.tag_configure("review", background="#fff7e6")
+        tree.tag_configure("missing", background="#f3f6f9")
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree.bind("<<TreeviewSelect>>", lambda _event, tab=name: self._on_table_select(tab))
+        self.display_trees[name] = tree
+        self.display_frames[name] = frame
+        self.display_dfs[name] = pd.DataFrame()
 
-        self.tree.grid(row=0, column=0, sticky='nsew')
-        vsb.grid(row=0, column=1, sticky='ns')
-        hsb.grid(row=1, column=0, sticky='ew')
-
-        parent.grid_rowconfigure(0, weight=1)
-        parent.grid_columnconfigure(0, weight=1)
-
-        # Bind row selection to update error distribution plot
-        self.tree.bind('<<TreeviewSelect>>', self._on_row_select)
-
-    def _build_plot_viewer(self, parent):
-        """Embedded matplotlib canvas."""
-        self.plot_frame = parent
-
-        # Create a default empty figure
+    def _build_plot_tab(self, parent):
         self.current_fig, self.current_ax = plt.subplots(figsize=(8, 5))
-        self.current_ax.text(0.5, 0.5, 'Run analysis to see plots',
-                             ha='center', va='center', fontsize=14, color='gray')
-
+        self.current_ax.text(0.5, 0.5, "Run analysis to see pass-rate plot",
+                             ha="center", va="center", fontsize=13, color="#66717d")
         self.canvas = FigureCanvasTkAgg(self.current_fig, master=parent)
         self.canvas.draw()
-
-        # Toolbar
         toolbar_frame = ttk.Frame(parent)
-        toolbar_frame.pack(fill='x')
+        toolbar_frame.pack(fill="x")
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
         self.toolbar.update()
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        self.canvas.get_tk_widget().pack(fill='both', expand=True)
+    def _build_trace_panel(self, parent):
+        top = ttk.Frame(parent)
+        top.pack(fill="x")
+        ttk.Label(top, textvariable=self.trace_title_var,
+                  font=("Helvetica", 11, "bold")).pack(side="left", anchor="w")
+        ttk.Button(top, text="Copy path:line", command=self._copy_path_line).pack(
+            side="right", padx=(6, 0))
+        ttk.Button(top, text="Open Source", command=self._open_source_file).pack(
+            side="right", padx=(6, 0))
+        ttk.Button(top, text="Show Raw Row", command=self._show_raw_row).pack(side="right")
 
-    # ---- Actions ----
+        self.path_line_value = ttk.Label(
+            parent,
+            textvariable=self.path_line_var,
+            style="Link.TLabel",
+            cursor="hand2",
+        )
+        self.path_line_value.pack(fill="x", pady=(4, 0))
+        self.path_line_value.bind("<Button-1>", lambda _event: self._open_source_file())
+        self.path_line_hint = ttk.Label(
+            parent,
+            text="Click the path or use Open Source to verify the row in the original report.",
+            style="Muted.TLabel",
+        )
+        self.path_line_hint.pack(fill="x", pady=(0, 6))
+        self.trace_text = tk.Text(parent, height=7, wrap="word", bd=0,
+                                  bg="#ffffff", fg="#17212b", relief="flat")
+        self.trace_text.pack(fill="both", expand=True)
+        self.trace_text.configure(state="disabled")
 
-    def _browse_dir(self):
-        path = filedialog.askdirectory(title='Select directory with .rpt files')
+    def _browse_data_dir(self):
+        path = filedialog.askdirectory(title="Select directory with .rpt files")
         if path:
             self.data_dir.set(path)
+            if not self.output_dir.get().strip():
+                self.output_dir.set(str(Path(path) / "voltage_margin_outputs"))
+
+    def _browse_output_dir(self):
+        path = filedialog.askdirectory(title="Select output directory")
+        if path:
+            self.output_dir.set(path)
+
+    def _browse_file(self, variable, title):
+        path = filedialog.askopenfilename(
+            title=title,
+            filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")],
+        )
+        if path:
+            variable.set(path)
+
+    def _selected_types(self):
+        return [name for name, var in self.type_vars.items() if var.get()]
 
     def _run_analysis(self):
-        """Load data and run pass rate analysis."""
         data_dir = self.data_dir.get().strip()
+        output_dir = self.output_dir.get().strip()
         if not data_dir or not os.path.isdir(data_dir):
-            messagebox.showerror('Error', 'Please select a valid data directory.')
+            messagebox.showerror("Input required", "Please select a valid input directory.")
+            return
+        if not output_dir:
+            output_dir = str(Path(data_dir) / "voltage_margin_outputs")
+            self.output_dir.set(output_dir)
+        types = self._selected_types()
+        if not types:
+            messagebox.showerror("Type required", "Select at least one analysis type.")
             return
 
-        self.status_var.set('Loading data...')
+        self.status_var.set("Running Phase 1 analysis...")
         self.root.update_idletasks()
-
         try:
-            self.bundles = load_all_data(data_dir)
-            if not self.bundles:
-                messagebox.showwarning('Warning', 'No .rpt files found in directory.')
-                self.status_var.set('No data found.')
-                return
-
-            self.status_var.set(
-                f'Loaded {len(self.bundles)} data bundles. Running analysis...')
-            self.root.update_idletasks()
-
-            self.analysis_results = run_full_analysis(self.bundles)
-            self.full_results_df = results_to_dataframe(self.analysis_results)
-
-            self._apply_waiver_filter()
-            self._populate_table()
+            result = run_phase1_pipeline(
+                Phase1RunConfig(
+                    data_dir=Path(data_dir),
+                    output_dir=Path(output_dir),
+                    column_map=Path(self.column_map_path.get()),
+                    policy=Path(self.policy_path.get()),
+                    types=types,
+                )
+            )
+            self.tables = load_output_package(result.output_dir)
+            self.summary_var.set(
+                f"{result.parameter_groups} groups, {result.total_arcs} arcs")
+            self._refresh_all_tables()
+            self._refresh_filter_options()
+            self._refresh_kpis()
+            self._show_margin_workspace()
             self._update_plot()
+            self.status_var.set(f"Analysis complete. Output: {result.output_dir}")
+        except Exception as exc:
+            logger.exception("Analysis failed")
+            messagebox.showerror("Analysis failed", str(exc))
+            self.status_var.set("Analysis failed.")
 
-            n = len(self.analysis_results)
-            total_arcs = sum(r.total_arcs for r in self.analysis_results)
-            self.status_var.set(
-                f'Analysis complete: {n} parameter groups, {total_arcs} total arcs.')
-
-        except Exception as e:
-            logger.exception('Analysis failed')
-            messagebox.showerror('Error', f'Analysis failed:\n{e}')
-            self.status_var.set('Analysis failed.')
-
-    def _apply_waiver_filter(self):
-        """Apply waiver toggle filter to results."""
-        if self.full_results_df.empty:
-            self.results_df = self.full_results_df
+    def _refresh_all_tables(self):
+        if self.tables is None:
             return
-        self.results_df = filter_results_by_waivers(
-            self.full_results_df,
-            waiver1_enabled=self.waiver1_var.get(),
-            optimistic_enabled=self.optimistic_var.get(),
+        self._populate_table("Pass Rate", self.tables.pass_rate, PASS_RATE_COLUMNS)
+        self._apply_margin_filters()
+        self._populate_table("Sensitivity", self.tables.sensitivity, SENSITIVITY_COLUMNS)
+        self._populate_table("Warnings", self._combined_warnings(), WARNING_COLUMNS)
+        self._populate_table("Trace", self.tables.margin_trace, TRACE_COLUMNS)
+
+    def _refresh_kpis(self):
+        if self.tables is None:
+            return
+        summary = summarize_margins(self.tables.all_margins, self.tables.margin_trace)
+        self.kpi_vars["margins"].set(str(summary.total_margins))
+        self.kpi_vars["ok"].set(str(summary.ok_margins))
+        self.kpi_vars["review"].set(str(summary.needs_review))
+        self.kpi_vars["trace"].set(str(summary.trace_rows))
+
+    def _combined_warnings(self):
+        if self.tables is None:
+            return pd.DataFrame()
+        warnings = []
+        if not self.tables.normalization_warnings.empty:
+            df = self.tables.normalization_warnings.copy()
+            df["warning_source"] = "normalization"
+            warnings.append(df)
+        if not self.tables.sensitivity_warnings.empty:
+            df = self.tables.sensitivity_warnings.copy()
+            df["warning_source"] = "sensitivity"
+            warnings.append(df)
+        return pd.concat(warnings, ignore_index=True, sort=False) if warnings else pd.DataFrame()
+
+    def _refresh_filter_options(self):
+        if self.tables is None:
+            return
+        margins = self.tables.all_margins
+        mapping = {
+            "source": "compare_source",
+            "type": "analysis_type",
+            "metric": "metric",
+            "corner": "corner",
+            "status": "margin_status",
+        }
+        for key, column in mapping.items():
+            values = ["All"] + unique_values(margins, column)
+            self.filter_boxes[key]["values"] = values
+            if self.filter_vars[key].get() not in values:
+                self.filter_vars[key].set("All")
+
+    def _reset_filters(self):
+        for var in self.filter_vars.values():
+            var.set("All")
+        self._apply_margin_filters()
+
+    def _apply_margin_filters(self):
+        if self.tables is None:
+            return
+        filtered = filter_margins(
+            self.tables.all_margins,
+            source=self.filter_vars["source"].get(),
+            analysis_type=self.filter_vars["type"].get(),
+            metric=self.filter_vars["metric"].get(),
+            corner=self.filter_vars["corner"].get(),
+            status=self.filter_vars["status"].get(),
         )
+        self._populate_table("Margins", filtered, MARGIN_COLUMNS)
+        if self.current_tab_name == "Margins":
+            self._select_first_margin()
 
-    def _on_waiver_toggle(self):
-        """Handle waiver checkbox change."""
-        self._apply_waiver_filter()
-        self._populate_table()
-        self._update_plot()
-
-    def _populate_table(self):
-        """Fill the treeview with current results."""
-        self.tree.delete(*self.tree.get_children())
-
-        if self.results_df.empty:
+    def _populate_table(self, name, df, preferred_columns):
+        tree = self.display_trees[name]
+        tree.delete(*tree.get_children())
+        columns = table_columns(df, preferred_columns)
+        tree["columns"] = columns
+        for column in columns:
+            tree.heading(column, text=column, command=lambda c=column, n=name: self._sort_table(n, c))
+            width = 230 if column in {"arc", "source_file", "source_file_relative"} else 120
+            tree.column(column, width=width, minwidth=70, anchor="w")
+        if df.empty:
+            self.display_dfs[name] = df
             return
+        display_df = df.reset_index(drop=True)
+        self.display_dfs[name] = display_df
+        for idx, row in display_df.iterrows():
+            values = [self._format_cell(row.get(column, "")) for column in columns]
+            tags = self._row_tags(name, row)
+            tree.insert("", "end", iid=str(idx), values=values, tags=tags)
 
-        for _, row in self.results_df.iterrows():
-            values = []
-            for col in self.tree['columns']:
-                val = row.get(col, '')
-                if isinstance(val, float):
-                    val = f'{val:.1f}'
-                values.append(val)
-            self.tree.insert('', 'end', values=values)
+    def _row_tags(self, name, row):
+        if name != "Margins":
+            return ()
+        status = str(row.get("margin_status", "") or "")
+        if status == "ok":
+            return ("ok",)
+        if status:
+            return ("review",)
+        return ("missing",)
 
-    def _sort_table(self, col):
-        """Sort treeview by column."""
-        items = [(self.tree.set(k, col), k) for k in self.tree.get_children()]
+    def _format_cell(self, value):
+        if pd.isna(value):
+            return ""
+        if isinstance(value, float):
+            return f"{value:.6g}"
+        return str(value)
+
+    def _sort_table(self, name, column):
+        df = self.display_dfs.get(name, pd.DataFrame())
+        if df.empty or column not in df.columns:
+            return
+        sorted_df = df.sort_values(column, kind="mergesort")
+        preferred = list(self.display_trees[name]["columns"])
+        self._populate_table(name, sorted_df, preferred)
+
+    def _on_tab_changed(self, _event):
+        selected = self.notebook.select()
+        self.current_tab_name = self.notebook.tab(selected, "text")
+
+    def _on_table_select(self, tab_name):
+        if tab_name != "Margins":
+            return
+        tree = self.display_trees[tab_name]
+        selected = tree.selection()
+        if not selected:
+            return
+        row = self.display_dfs[tab_name].iloc[int(selected[0])]
+        self._show_margin_detail(row)
+
+    def _show_margin_workspace(self):
+        self.notebook.select(1)
+        self.current_tab_name = "Margins"
+        self._select_first_margin()
+
+    def _select_first_margin(self):
+        tree = self.display_trees.get("Margins")
+        if tree is None:
+            return
+        children = tree.get_children()
+        if not children:
+            self.trace_title_var.set("No margin rows available for current filters.")
+            self.path_line_var.set("")
+            self.selected_margin_detail = {}
+            self._write_trace_text("No voltage margin rows match the current filters.")
+            return
+        first = children[0]
+        tree.selection_set(first)
+        tree.focus(first)
+        tree.see(first)
+        row = self.display_dfs["Margins"].iloc[int(first)]
+        self._show_margin_detail(row)
+
+    def _show_margin_detail(self, row):
+        detail = format_margin_trace_detail(row)
+        self.selected_margin_detail = detail
+        self.trace_title_var.set(detail["title"] or "Selected margin")
+        self.path_line_var.set(detail["path_line"])
+        text = "\n".join(
+            [
+                f"Arc: {detail['arc']}",
+                f"Required: {detail['required_formula']}",
+                f"Signed: {detail['signed_formula']}",
+                f"Sensitivity trace: {detail['sensitivity_trace_id']}",
+                f"Low sources: {detail['low_sources']}",
+                f"High sources: {detail['high_sources']}",
+            ]
+        )
+        self.trace_text.configure(state="normal")
+        self.trace_text.delete("1.0", "end")
+        self.trace_text.insert("1.0", text)
+        self.trace_text.configure(state="disabled")
+
+    def _write_trace_text(self, text):
+        self.trace_text.configure(state="normal")
+        self.trace_text.delete("1.0", "end")
+        self.trace_text.insert("1.0", text)
+        self.trace_text.configure(state="disabled")
+
+    def _copy_path_line(self):
+        path_line = self.selected_margin_detail.get("path_line", "")
+        if path_line:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(path_line)
+            self.status_var.set(f"Copied {path_line}")
+
+    def _open_source_file(self):
+        source_file = self.selected_margin_detail.get("source_file", "")
+        if source_file and Path(source_file).exists():
+            webbrowser.open(Path(source_file).resolve().as_uri())
+        elif source_file:
+            messagebox.showwarning("File not found", source_file)
+
+    def _show_raw_row(self):
+        source_file = self.selected_margin_detail.get("source_file", "")
+        line_number = self.selected_margin_detail.get("source_line_number", "")
+        if not source_file or not line_number:
+            return
         try:
-            items.sort(key=lambda t: float(t[0]))
-        except ValueError:
-            items.sort(key=lambda t: t[0])
-
-        for idx, (_, k) in enumerate(items):
-            self.tree.move(k, '', idx)
-
-    def _on_row_select(self, event):
-        """When a table row is selected, show error distribution if applicable."""
-        if self.plot_type_var.get() != 'error_distribution':
+            raw = read_source_line(source_file, line_number)
+        except Exception as exc:
+            messagebox.showerror("Could not read source row", str(exc))
             return
-        self._update_plot()
+        messagebox.showinfo("Raw Source Row", raw or "Line not found.")
+
+    def _open_output_folder(self):
+        output_dir = self.output_dir.get().strip()
+        if output_dir and Path(output_dir).exists():
+            webbrowser.open(Path(output_dir).resolve().as_uri())
+
+    def _export_current_table(self):
+        df = self.display_dfs.get(self.current_tab_name, pd.DataFrame())
+        if df.empty:
+            messagebox.showinfo("No data", "Current tab has no rows to export.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Export Current Table",
+        )
+        if path:
+            df.to_csv(path, index=False)
+            self.status_var.set(f"Exported {self.current_tab_name} to {path}")
 
     def _update_plot(self):
-        """Redraw the plot based on current selection."""
-        plot_type = self.plot_type_var.get()
-
-        # Clear old canvas
+        if self.tables is None or self.tables.pass_rate.empty:
+            return
         plt.close(self.current_fig)
-
-        if plot_type == 'bar_chart':
-            self.current_fig = plot_pass_rate_bars(
-                self.full_results_df,
-                title='Pass Rate Summary',
-                waiver1=self.waiver1_var.get(),
-                optimistic=self.optimistic_var.get(),
-            )
-        elif plot_type == 'heatmap':
-            pr_col = self.heatmap_pr_var.get()
-            self.current_fig = plot_pass_rate_heatmap(
-                self.full_results_df, pr_column=pr_col,
-                title=f'Heatmap: {pr_col}',
-            )
-        elif plot_type == 'error_distribution':
-            self.current_fig = self._get_error_dist_plot()
-        else:
-            self.current_fig, ax = plt.subplots()
-            ax.text(0.5, 0.5, 'Select a plot type', ha='center', va='center')
-
-        # Replace canvas
+        self.current_fig = plot_pass_rate_bars(self.tables.pass_rate, title="Pass Rate Summary")
         self.canvas.get_tk_widget().destroy()
         self.toolbar.destroy()
-
-        self.canvas = FigureCanvasTkAgg(self.current_fig, master=self.plot_frame)
+        parent = self.notebook.nametowidget(self.notebook.tabs()[-1])
+        self.canvas = FigureCanvasTkAgg(self.current_fig, master=parent)
         self.canvas.draw()
-
-        toolbar_frame = ttk.Frame(self.plot_frame)
-        toolbar_frame.pack(fill='x')
+        toolbar_frame = ttk.Frame(parent)
+        toolbar_frame.pack(fill="x")
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
         self.toolbar.update()
-
-        self.canvas.get_tk_widget().pack(fill='both', expand=True)
-
-    def _get_error_dist_plot(self):
-        """Get error distribution plot for selected row."""
-        selected = self.tree.selection()
-        if not selected:
-            fig, ax = plt.subplots()
-            ax.text(0.5, 0.5, 'Select a row in the table\nto see error distribution',
-                    ha='center', va='center', fontsize=12, color='gray')
-            return fig
-
-        item = self.tree.item(selected[0])
-        vals = item['values']
-        corner, type_name, param = str(vals[0]), str(vals[1]), str(vals[2])
-
-        # Find matching analysis result
-        for r in self.analysis_results:
-            if (r.corner == corner and r.type_name == type_name
-                    and r.param_name == param):
-                return plot_error_distribution(
-                    r.arc_results, param,
-                    title=f'Error Distribution: {corner} / {type_name} / {param}')
-
-        fig, ax = plt.subplots()
-        ax.text(0.5, 0.5, 'No arc data found', ha='center', va='center')
-        return fig
-
-    def _export_csv(self):
-        """Export current results table to CSV."""
-        if self.results_df.empty:
-            messagebox.showinfo('Info', 'No results to export.')
-            return
-
-        path = filedialog.asksaveasfilename(
-            defaultextension='.csv',
-            filetypes=[('CSV files', '*.csv'), ('All files', '*.*')],
-            title='Export Results',
-        )
-        if path:
-            self.results_df.to_csv(path, index=False)
-            self.status_var.set(f'Exported to {path}')
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def _save_plot(self):
-        """Save current plot to file."""
         path = filedialog.asksaveasfilename(
-            defaultextension='.png',
-            filetypes=[('PNG', '*.png'), ('PDF', '*.pdf'), ('SVG', '*.svg')],
-            title='Save Plot',
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("PDF", "*.pdf"), ("SVG", "*.svg")],
+            title="Save Plot",
         )
         if path:
-            self.current_fig.savefig(path, dpi=150, bbox_inches='tight')
-            self.status_var.set(f'Plot saved to {path}')
+            self.current_fig.savefig(path, dpi=150, bbox_inches="tight")
+            self.status_var.set(f"Plot saved to {path}")
 
 
 def launch_gui():
     """Entry point to launch the GUI."""
     logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s - %(levelname)s - %(message)s')
-
+                        format="%(asctime)s - %(levelname)s - %(message)s")
     root = tk.Tk()
-
-    # Try to use a modern theme
-    style = ttk.Style(root)
-    available_themes = style.theme_names()
-    for theme in ['clam', 'alt', 'default']:
-        if theme in available_themes:
-            style.theme_use(theme)
-            break
-
-    app = VoltageMarginApp(root)
+    VoltageMarginApp(root)
     root.mainloop()

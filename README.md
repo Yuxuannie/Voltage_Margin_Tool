@@ -129,6 +129,10 @@ voltage_margin_outputs/
     margin_summary.csv
     margin_efficiency_curve.csv
     high_margin_objects.csv
+  trace/
+    source_rows.csv
+    sensitivity_source_refs.csv
+    margin_trace.csv
 ```
 
 `all_errors/` includes optimistic and pessimistic rows. `optimistic_only/`
@@ -203,6 +207,45 @@ per-object margin rows. They include:
 aggregation = per_object
 ```
 
+## Traceability
+
+Phase 1 outputs include trace metadata so each voltage margin can be audited
+back to the source `.rpt` rows and formula inputs.
+
+`normalized/normalized_rows.csv` includes source provenance columns such as:
+
+```text
+trace_id, input_root, source_file, source_file_relative,
+source_line_number, source_row_index,
+source_mc_column, source_lib_column, source_dif_column, source_rel_column
+```
+
+`sensitivity/sensitivity.csv` includes pair provenance and formula columns such
+as:
+
+```text
+sensitivity_trace_id, low_voltage_v, high_voltage_v,
+low_lib_value_ps, high_lib_value_ps,
+low_source_refs_summary, high_source_refs_summary,
+sensitivity_formula_id, sensitivity_formula
+```
+
+`per_object_margin.csv` includes margin trace and formula columns:
+
+```text
+margin_trace_id, normalized_trace_id, sensitivity_trace_id,
+source_file, source_file_relative, source_line_number,
+margin_formula_id, required_margin_formula, signed_margin_formula
+```
+
+Detailed trace tables live under `trace/`:
+
+- `source_rows.csv`: one row per normalized source contribution.
+- `sensitivity_source_refs.csv`: every low/high source row used by each
+  sensitivity pair, including duplicate-voltage rows that contributed to a mean.
+- `margin_trace.csv`: one audit row per margin row linking normalized trace,
+  sensitivity trace, source path/line, and formula fields.
+
 ## Policy And Mapping
 
 Thresholds, waivers, direction rule, and margin points live in:
@@ -222,12 +265,19 @@ Do not edit Python constants for threshold tuning. Edit the policy YAML.
 
 ## GUI
 
-The Tkinter GUI is still present for the old workflow:
+The Tkinter GUI launches a Phase 1 workbench:
 
 ```bash
 python run_gui.py
 ```
 
-Phase 1 does not update the GUI. It does not expose normalized rows, per-pair
-sensitivity, per-object margin outputs, or the YAML policy/mapping controls.
-Those are CLI/core features for this phase.
+The workbench supports:
+
+- selecting input and output directories
+- selecting policy and column-mapping YAML files
+- choosing `delay`, `slew`, and `hold` analysis types
+- running the Phase 1 output package flow
+- browsing pass-rate, margin, sensitivity, warning, and trace tables
+- filtering margin rows by source, type, metric, corner, and status
+- selecting a margin row to inspect formula text and source `path:line`
+- opening source files, copying `path:line`, and showing the raw source row
