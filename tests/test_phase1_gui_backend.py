@@ -136,6 +136,16 @@ def test_summarize_margins_counts_status_and_trace_rows():
     assert summary.trace_rows == 2
 
 
+def test_load_output_package_treats_empty_csv_files_as_empty_tables(tmp_path):
+    output_dir = tmp_path / "outputs"
+    (output_dir / "normalized").mkdir(parents=True)
+    (output_dir / "normalized" / "normalization_warnings.csv").write_text("")
+
+    tables = load_output_package(output_dir)
+
+    assert tables.normalization_warnings.empty
+
+
 def test_margin_trace_detail_and_source_line_lookup(tmp_path):
     source = tmp_path / "source.rpt"
     source.write_text("header\n\nrow-one\nrow-two\n")

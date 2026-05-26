@@ -115,7 +115,12 @@ def run_phase1_pipeline(config: Phase1RunConfig) -> Phase1RunResult:
 
 
 def _read_csv(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path) if path.exists() else pd.DataFrame()
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
 
 
 def load_output_package(output_dir: Path) -> OutputTables:
