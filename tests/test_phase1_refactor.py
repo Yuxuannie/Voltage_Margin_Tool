@@ -75,11 +75,31 @@ def test_normalized_loader_handles_hold_blank_line_negative_nominal_and_arc_suff
     assert normalized["arc"].unique().tolist() == [
         arc.replace("_4_2", "_4-2")
     ]
+    assert {
+        "trace_id",
+        "input_root",
+        "source_file",
+        "source_file_relative",
+        "source_line_number",
+        "source_row_index",
+        "source_mc_column",
+        "source_lib_column",
+        "source_dif_column",
+        "source_rel_column",
+    }.issubset(normalized.columns)
+    assert normalized["input_root"].unique().tolist() == [str(tmp_path.resolve())]
+    assert normalized["source_line_number"].unique().tolist() == [3]
+    assert normalized["source_row_index"].unique().tolist() == [0]
+    assert normalized["source_file_relative"].str.endswith(".rpt").all()
 
     nominal = normalized[normalized["metric"] == "Nominal"].iloc[0]
     assert nominal["mc_value_ps"] == -1240.43
     assert nominal["dif_ps"] == -10.0
     assert nominal["is_optimistic_risk"] is True
+    assert nominal["source_mc_column"] == "MC_Nominal"
+    assert nominal["source_lib_column"] == "CDNS_Lib_Nominal"
+    assert nominal["source_dif_column"] == "CDNS_Lib_Nominal_Dif"
+    assert nominal["source_rel_column"] == "CDNS_Lib_Nominal_Rel"
 
 
 def test_normalized_loader_parses_mc_cell_name_and_canonical_metric_case(tmp_path):
@@ -245,13 +265,32 @@ def test_sensitivity_uses_adjacent_pair_local_slope_for_target_corner():
             },
         ]
     )
+    normalized["trace_id"] = [f"norm-{idx + 1:08d}" for idx in range(len(normalized))]
+    normalized["input_root"] = "/input"
+    normalized["source_file"] = [f"/input/source_{idx}.rpt" for idx in range(len(normalized))]
+    normalized["source_file_relative"] = [f"source_{idx}.rpt" for idx in range(len(normalized))]
+    normalized["source_line_number"] = [idx + 3 for idx in range(len(normalized))]
+    normalized["source_row_index"] = list(range(len(normalized)))
 
     sensitivity, warnings = build_sensitivity_rows(normalized, load_policy())
 
     assert warnings.empty
     assert len(sensitivity) == 4
     assert {"pair_v_low", "pair_v_high", "pair_role"}.issubset(sensitivity.columns)
+    assert {
+        "sensitivity_trace_id",
+        "low_voltage_v",
+        "high_voltage_v",
+        "low_lib_value_ps",
+        "high_lib_value_ps",
+        "low_source_refs_summary",
+        "high_source_refs_summary",
+        "sensitivity_formula_id",
+        "sensitivity_formula",
+    }.issubset(sensitivity.columns)
     assert (sensitivity["valid_points"] == 2).all()
+    assert sensitivity["sensitivity_trace_id"].notna().all()
+    assert sensitivity["sensitivity_formula_id"].eq("adjacent_pair_lib_slope_ps_per_mv").all()
 
     first = sensitivity[sensitivity["corner"] == "ssgnp_0p450v_m40c"].iloc[0]
     assert first["pair_role"] == "only_pair"
@@ -268,6 +307,20 @@ def test_sensitivity_uses_adjacent_pair_local_slope_for_target_corner():
 
     margins = build_margin_outputs(normalized, sensitivity, load_policy())
     optimistic = margins.optimistic_only_per_object
+    assert {
+        "margin_trace_id",
+        "normalized_trace_id",
+        "sensitivity_trace_id",
+        "source_file",
+        "source_file_relative",
+        "source_line_number",
+        "margin_formula_id",
+        "required_margin_formula",
+        "signed_margin_formula",
+    }.issubset(optimistic.columns)
+    assert optimistic["margin_formula_id"].eq("margin_from_dif_and_sensitivity").all()
+    assert hasattr(margins, "margin_trace")
+    assert not margins.margin_trace.empty
     assert set(optimistic["corner"]) == {"ssgnp_0p465v_m40c", "ssgnp_0p480v_m40c"}
     mid_margins = optimistic[optimistic["corner"] == "ssgnp_0p465v_m40c"]
     assert len(mid_margins) == 2
@@ -281,6 +334,81 @@ def test_sensitivity_uses_adjacent_pair_local_slope_for_target_corner():
     ].iloc[0]
     assert mid_summary["aggregation"] == "per_object"
     assert math.isclose(mid_summary["max_margin_mv"], 3.0)
+
+
+def test_sensitivity_trace_records_all_duplicate_voltage_source_rows():
+    arc = "combinational_CELL_Z_rise_A_rise_NO_CONDITION_4-4"
+    normalized = pd.DataFrame(
+        [
+            {
+                "trace_id": "norm-low-a",
+                "input_root": "/input",
+                "source_file": "/input/low_a.rpt",
+                "source_file_relative": "low_a.rpt",
+                "source_line_number": 3,
+                "source_row_index": 0,
+                "process": "n2p",
+                "process_version": "v1p0",
+                "corner": "ssgnp_0p450v_m40c",
+                "corner_family": "ssgnp_<V>_m40c",
+                "temperature_c": -40,
+                "compare_source": "fmc_compare",
+                "voltage_v": 0.450,
+                "analysis_type": "delay",
+                "metric": "Late_Sigma",
+                "arc": arc,
+                "lib_value_ps": 100.0,
+            },
+            {
+                "trace_id": "norm-low-b",
+                "input_root": "/input",
+                "source_file": "/input/low_b.rpt",
+                "source_file_relative": "low_b.rpt",
+                "source_line_number": 4,
+                "source_row_index": 1,
+                "process": "n2p",
+                "process_version": "v1p0",
+                "corner": "ssgnp_0p450v_m40c",
+                "corner_family": "ssgnp_<V>_m40c",
+                "temperature_c": -40,
+                "compare_source": "fmc_compare",
+                "voltage_v": 0.450,
+                "analysis_type": "delay",
+                "metric": "Late_Sigma",
+                "arc": arc,
+                "lib_value_ps": 120.0,
+            },
+            {
+                "trace_id": "norm-high",
+                "input_root": "/input",
+                "source_file": "/input/high.rpt",
+                "source_file_relative": "high.rpt",
+                "source_line_number": 3,
+                "source_row_index": 0,
+                "process": "n2p",
+                "process_version": "v1p0",
+                "corner": "ssgnp_0p465v_m40c",
+                "corner_family": "ssgnp_<V>_m40c",
+                "temperature_c": -40,
+                "compare_source": "fmc_compare",
+                "voltage_v": 0.465,
+                "analysis_type": "delay",
+                "metric": "Late_Sigma",
+                "arc": arc,
+                "lib_value_ps": 140.0,
+            },
+        ]
+    )
+
+    sensitivity, warnings = build_sensitivity_rows(normalized, load_policy())
+
+    assert warnings.empty
+    assert len(sensitivity) == 2
+    assert sensitivity["low_lib_value_ps"].unique().tolist() == [110.0]
+    refs = sensitivity.attrs["source_refs"]
+    low_refs = refs[refs["pair_side"] == "low"]
+    assert set(low_refs["source_trace_id"]) == {"norm-low-a", "norm-low-b"}
+    assert set(low_refs["source_file_relative"]) == {"low_a.rpt", "low_b.rpt"}
 
 
 def test_margin_output_skips_rows_when_sensitivity_has_insufficient_voltage_points():
@@ -396,6 +524,9 @@ def test_cli_writes_phase1_output_package(tmp_path):
     assert (output_dir / "all_errors" / "per_object_margin.csv").exists()
     assert (output_dir / "optimistic_only" / "per_object_margin.csv").exists()
     assert (output_dir / "pass_rate" / "pass_rate_results.csv").exists()
+    assert (output_dir / "trace" / "source_rows.csv").exists()
+    assert (output_dir / "trace" / "sensitivity_source_refs.csv").exists()
+    assert (output_dir / "trace" / "margin_trace.csv").exists()
 
     per_arc = pd.read_csv(output_dir / "pass_rate" / "per_arc_pass_fail.csv")
     expected_per_arc_columns = {
@@ -426,3 +557,14 @@ def test_cli_writes_phase1_output_package(tmp_path):
     optimistic = pd.read_csv(output_dir / "optimistic_only" / "per_object_margin.csv")
     assert not optimistic.empty
     assert set(optimistic["is_optimistic_risk"]) == {True}
+    assert {"margin_trace_id", "normalized_trace_id", "sensitivity_trace_id"}.issubset(
+        optimistic.columns)
+
+    source_trace = pd.read_csv(output_dir / "trace" / "source_rows.csv")
+    assert {"trace_id", "source_file", "source_line_number"}.issubset(source_trace.columns)
+    sensitivity_trace = pd.read_csv(output_dir / "trace" / "sensitivity_source_refs.csv")
+    assert {"sensitivity_trace_id", "pair_side", "source_trace_id"}.issubset(
+        sensitivity_trace.columns)
+    margin_trace = pd.read_csv(output_dir / "trace" / "margin_trace.csv")
+    assert {"margin_trace_id", "normalized_trace_id", "sensitivity_trace_id"}.issubset(
+        margin_trace.columns)

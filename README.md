@@ -129,6 +129,10 @@ voltage_margin_outputs/
     margin_summary.csv
     margin_efficiency_curve.csv
     high_margin_objects.csv
+  trace/
+    source_rows.csv
+    sensitivity_source_refs.csv
+    margin_trace.csv
 ```
 
 `all_errors/` includes optimistic and pessimistic rows. `optimistic_only/`
@@ -202,6 +206,45 @@ per-object margin rows. They include:
 ```text
 aggregation = per_object
 ```
+
+## Traceability
+
+Phase 1 outputs include trace metadata so each voltage margin can be audited
+back to the source `.rpt` rows and formula inputs.
+
+`normalized/normalized_rows.csv` includes source provenance columns such as:
+
+```text
+trace_id, input_root, source_file, source_file_relative,
+source_line_number, source_row_index,
+source_mc_column, source_lib_column, source_dif_column, source_rel_column
+```
+
+`sensitivity/sensitivity.csv` includes pair provenance and formula columns such
+as:
+
+```text
+sensitivity_trace_id, low_voltage_v, high_voltage_v,
+low_lib_value_ps, high_lib_value_ps,
+low_source_refs_summary, high_source_refs_summary,
+sensitivity_formula_id, sensitivity_formula
+```
+
+`per_object_margin.csv` includes margin trace and formula columns:
+
+```text
+margin_trace_id, normalized_trace_id, sensitivity_trace_id,
+source_file, source_file_relative, source_line_number,
+margin_formula_id, required_margin_formula, signed_margin_formula
+```
+
+Detailed trace tables live under `trace/`:
+
+- `source_rows.csv`: one row per normalized source contribution.
+- `sensitivity_source_refs.csv`: every low/high source row used by each
+  sensitivity pair, including duplicate-voltage rows that contributed to a mean.
+- `margin_trace.csv`: one audit row per margin row linking normalized trace,
+  sensitivity trace, source path/line, and formula fields.
 
 ## Policy And Mapping
 

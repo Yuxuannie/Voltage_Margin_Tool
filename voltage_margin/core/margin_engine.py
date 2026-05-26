@@ -18,6 +18,7 @@ class MarginOutputs:
     optimistic_only_curve: pd.DataFrame
     all_errors_high_margin: pd.DataFrame
     optimistic_only_high_margin: pd.DataFrame
+    margin_trace: pd.DataFrame
 
 
 SENSITIVITY_COLUMNS = [
@@ -31,9 +32,18 @@ SENSITIVITY_COLUMNS = [
     "temperature_c",
     "corner",
     "voltage_v",
+    "sensitivity_trace_id",
     "pair_v_low",
     "pair_v_high",
     "pair_role",
+    "low_voltage_v",
+    "high_voltage_v",
+    "low_lib_value_ps",
+    "high_lib_value_ps",
+    "low_source_refs_summary",
+    "high_source_refs_summary",
+    "sensitivity_formula_id",
+    "sensitivity_formula",
     "voltage_values_v",
     "lib_values_ps",
     "valid_points",
@@ -60,6 +70,39 @@ SENSITIVITY_WARNING_COLUMNS = [
     "valid_points",
     "warning_code",
     "warning_message",
+]
+
+
+SENSITIVITY_SOURCE_REF_COLUMNS = [
+    "sensitivity_trace_id",
+    "pair_side",
+    "source_trace_id",
+    "input_root",
+    "source_file",
+    "source_file_relative",
+    "source_line_number",
+    "source_row_index",
+    "voltage_v",
+    "lib_value_ps",
+]
+
+
+MARGIN_TRACE_COLUMNS = [
+    "margin_trace_id",
+    "normalized_trace_id",
+    "sensitivity_trace_id",
+    "input_root",
+    "source_file",
+    "source_file_relative",
+    "source_line_number",
+    "source_row_index",
+    "dif_ps",
+    "sensitivity_ps_per_mv",
+    "required_margin_mv",
+    "signed_margin_mv",
+    "margin_formula_id",
+    "required_margin_formula",
+    "signed_margin_formula",
 ]
 
 
@@ -91,16 +134,64 @@ def _linear_fit(voltages, values):
     return slope, intercept, r_squared
 
 
+def _source_ref_summary(source_rows):
+    refs = []
+    for _, source in source_rows.iterrows():
+        file_name = source.get("source_file_relative") or source.get("source_file")
+        line = source.get("source_line_number")
+        refs.append(f"{file_name}:{line}")
+    return ";".join(refs)
+
+
+def _source_ref_rows(sensitivity_trace_id, pair_side, source_rows):
+    rows = []
+    for _, source in source_rows.iterrows():
+        rows.append(
+            {
+                "sensitivity_trace_id": sensitivity_trace_id,
+                "pair_side": pair_side,
+                "source_trace_id": source.get("trace_id"),
+                "input_root": source.get("input_root"),
+                "source_file": source.get("source_file"),
+                "source_file_relative": source.get("source_file_relative"),
+                "source_line_number": source.get("source_line_number"),
+                "source_row_index": source.get("source_row_index"),
+                "voltage_v": source.get("voltage_v"),
+                "lib_value_ps": source.get("lib_value_ps"),
+            }
+        )
+    return rows
+
+
+def _sensitivity_formula(low_value, high_value, low_voltage, high_voltage):
+    return (
+        "sensitivity_ps_per_mv = "
+        f"abs({high_value:g} - {low_value:g}) / "
+        f"abs(({high_voltage:g} - {low_voltage:g}) * 1000)"
+    )
+
+
+def _required_margin_formula(dif_ps, sensitivity):
+    return f"required_margin_mv = abs({dif_ps:g}) / {sensitivity:g}"
+
+
+def _signed_margin_formula(dif_ps, sensitivity):
+    return f"signed_margin_mv = {dif_ps:g} / {sensitivity:g}"
+
+
 def build_sensitivity_rows(normalized_rows, policy=None):
     """Build per-target-corner sensitivities from adjacent voltage pairs."""
     if policy is None:
         policy = load_policy()
 
     rows = []
+    source_ref_rows = []
     warnings = []
     if normalized_rows.empty:
-        return pd.DataFrame(rows, columns=SENSITIVITY_COLUMNS), pd.DataFrame(
-            warnings, columns=SENSITIVITY_WARNING_COLUMNS)
+        sensitivity_df = pd.DataFrame(rows, columns=SENSITIVITY_COLUMNS)
+        sensitivity_df.attrs["source_refs"] = pd.DataFrame(
+            source_ref_rows, columns=SENSITIVITY_SOURCE_REF_COLUMNS)
+        return sensitivity_df, pd.DataFrame(warnings, columns=SENSITIVITY_WARNING_COLUMNS)
 
     normalized_rows = _ensure_compare_source(normalized_rows)
     group_cols = [
@@ -125,6 +216,10 @@ def build_sensitivity_rows(normalized_rows, policy=None):
         )
         available = voltage_values["voltage_v"].tolist()
         lib_values = voltage_values["lib_value_ps"].tolist()
+        voltage_sources = {
+            float(voltage): source_group.copy()
+            for voltage, source_group in group_data.groupby("voltage_v")
+        }
 
         if len(available) < policy["sensitivity"].get("min_voltage_points", 2):
             warnings.append(
@@ -151,14 +246,31 @@ def build_sensitivity_rows(normalized_rows, policy=None):
                 pair_voltages = [available[low_index], available[high_index]]
                 pair_values = [lib_values[low_index], lib_values[high_index]]
                 slope, intercept, r_squared = _linear_fit(pair_voltages, pair_values)
+                sensitivity_trace_id = f"sens-{len(rows) + 1:08d}"
+                low_sources = voltage_sources[pair_voltages[0]]
+                high_sources = voltage_sources[pair_voltages[1]]
+                source_ref_rows.extend(
+                    _source_ref_rows(sensitivity_trace_id, "low", low_sources))
+                source_ref_rows.extend(
+                    _source_ref_rows(sensitivity_trace_id, "high", high_sources))
                 rows.append(
                     {
                         **metadata,
                         "corner": target["corner"],
                         "voltage_v": target_voltage,
+                        "sensitivity_trace_id": sensitivity_trace_id,
                         "pair_v_low": pair_voltages[0],
                         "pair_v_high": pair_voltages[1],
                         "pair_role": role,
+                        "low_voltage_v": pair_voltages[0],
+                        "high_voltage_v": pair_voltages[1],
+                        "low_lib_value_ps": pair_values[0],
+                        "high_lib_value_ps": pair_values[1],
+                        "low_source_refs_summary": _source_ref_summary(low_sources),
+                        "high_source_refs_summary": _source_ref_summary(high_sources),
+                        "sensitivity_formula_id": "adjacent_pair_lib_slope_ps_per_mv",
+                        "sensitivity_formula": _sensitivity_formula(
+                            pair_values[0], pair_values[1], pair_voltages[0], pair_voltages[1]),
                         "voltage_values_v": ";".join(f"{v:g}" for v in pair_voltages),
                         "lib_values_ps": ";".join(f"{v:g}" for v in pair_values),
                         "valid_points": len(pair_voltages),
@@ -171,8 +283,10 @@ def build_sensitivity_rows(normalized_rows, policy=None):
                     }
                 )
 
-    return pd.DataFrame(rows, columns=SENSITIVITY_COLUMNS), pd.DataFrame(
-        warnings, columns=SENSITIVITY_WARNING_COLUMNS)
+    sensitivity_df = pd.DataFrame(rows, columns=SENSITIVITY_COLUMNS)
+    sensitivity_df.attrs["source_refs"] = pd.DataFrame(
+        source_ref_rows, columns=SENSITIVITY_SOURCE_REF_COLUMNS)
+    return sensitivity_df, pd.DataFrame(warnings, columns=SENSITIVITY_WARNING_COLUMNS)
 
 
 def _adjacent_pairs_for_index(index, length):
@@ -207,7 +321,7 @@ def build_margin_outputs(normalized_rows, sensitivity_rows, policy=None):
     ]
     if normalized_rows.empty:
         empty = pd.DataFrame()
-        return MarginOutputs(empty, empty, empty, empty, empty, empty, empty, empty)
+        return MarginOutputs(empty, empty, empty, empty, empty, empty, empty, empty, empty)
 
     normalized_rows = _ensure_compare_source(normalized_rows)
     sensitivity_rows = _ensure_compare_source(sensitivity_rows)
@@ -219,6 +333,7 @@ def build_margin_outputs(normalized_rows, sensitivity_rows, policy=None):
     )
 
     rows = []
+    margin_trace_rows = []
     for _, row in merged.iterrows():
         dif_ps = _finite_float(row.get("dif_ps"))
         sensitivity = _finite_float(row.get("sensitivity_ps_per_mv"))
@@ -239,8 +354,25 @@ def build_margin_outputs(normalized_rows, sensitivity_rows, policy=None):
             signed_margin = dif_ps / sensitivity
             required_margin = abs(dif_ps) / sensitivity
 
+        margin_trace_id = f"margin-{len(rows) + 1:08d}"
+        normalized_trace_id = row.get("trace_id")
+        sensitivity_trace_id = row.get("sensitivity_trace_id")
+        margin_formula_id = "margin_from_dif_and_sensitivity"
+        required_formula = (
+            _required_margin_formula(dif_ps, sensitivity)
+            if dif_ps is not None and sensitivity is not None
+            else ""
+        )
+        signed_formula = (
+            _signed_margin_formula(dif_ps, sensitivity)
+            if dif_ps is not None and sensitivity is not None
+            else ""
+        )
         rows.append(
             {
+                "margin_trace_id": margin_trace_id,
+                "normalized_trace_id": normalized_trace_id,
+                "sensitivity_trace_id": sensitivity_trace_id,
                 "process": row.get("process"),
                 "process_version": row.get("process_version"),
                 "compare_source": row.get("compare_source"),
@@ -253,6 +385,10 @@ def build_margin_outputs(normalized_rows, sensitivity_rows, policy=None):
                 "metric": row.get("metric"),
                 "arc": row.get("arc"),
                 "cell_name": row.get("cell_name"),
+                "source_file": row.get("source_file"),
+                "source_file_relative": row.get("source_file_relative"),
+                "source_line_number": row.get("source_line_number"),
+                "source_row_index": row.get("source_row_index"),
                 "mc_value_ps": row.get("mc_value_ps"),
                 "lib_value_ps": row.get("lib_value_ps"),
                 "dif_ps": dif_ps,
@@ -270,7 +406,29 @@ def build_margin_outputs(normalized_rows, sensitivity_rows, policy=None):
                 "fit_r2": row.get("fit_r2"),
                 "valid_voltage_points": row.get("valid_points"),
                 "margin_status": status,
+                "margin_formula_id": margin_formula_id,
+                "required_margin_formula": required_formula,
+                "signed_margin_formula": signed_formula,
                 "warning": "" if status == "ok" else status,
+            }
+        )
+        margin_trace_rows.append(
+            {
+                "margin_trace_id": margin_trace_id,
+                "normalized_trace_id": normalized_trace_id,
+                "sensitivity_trace_id": sensitivity_trace_id,
+                "input_root": row.get("input_root"),
+                "source_file": row.get("source_file"),
+                "source_file_relative": row.get("source_file_relative"),
+                "source_line_number": row.get("source_line_number"),
+                "source_row_index": row.get("source_row_index"),
+                "dif_ps": dif_ps,
+                "sensitivity_ps_per_mv": sensitivity,
+                "required_margin_mv": required_margin,
+                "signed_margin_mv": signed_margin,
+                "margin_formula_id": margin_formula_id,
+                "required_margin_formula": required_formula,
+                "signed_margin_formula": signed_formula,
             }
         )
 
@@ -288,6 +446,7 @@ def build_margin_outputs(normalized_rows, sensitivity_rows, policy=None):
         optimistic_only_curve=_coverage_curve(optimistic, policy),
         all_errors_high_margin=_high_margin(all_errors),
         optimistic_only_high_margin=_high_margin(optimistic),
+        margin_trace=pd.DataFrame(margin_trace_rows, columns=MARGIN_TRACE_COLUMNS),
     )
 
 

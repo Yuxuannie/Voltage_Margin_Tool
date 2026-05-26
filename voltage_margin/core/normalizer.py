@@ -64,11 +64,13 @@ def _metric_columns_present(df, metric_map):
     return bool(metric_map.get("mc_value") in df.columns and metric_map.get("lib_value") in df.columns)
 
 
-def _normalize_file(path, config):
+def _normalize_file(path, config, input_root):
     metadata = parse_phase1_filename(path, config)
     if metadata is None:
         return [], None, []
 
+    path = Path(path)
+    input_root_path = Path(input_root)
     df = read_phase1_rpt(path, config)
     source_cfg = config["compare_sources"][metadata["compare_source"]]
     warnings = []
@@ -159,8 +161,19 @@ def _normalize_file(path, config):
             ci_ub = _as_float(_column_value(row, metric_map.get("ci_ub")))
             has_real_ci = ci_lb is not None and ci_ub is not None
 
+            trace_id = f"norm-{len(rows) + 1:08d}"
             rows.append(
                 {
+                    "trace_id": trace_id,
+                    "input_root": str(input_root_path),
+                    "source_file": str(path.resolve()),
+                    "source_file_relative": str(path.resolve().relative_to(input_root_path)),
+                    "source_line_number": int(row_index) + 3,
+                    "source_row_index": int(row_index),
+                    "source_mc_column": metric_map.get("mc_value"),
+                    "source_lib_column": metric_map.get("lib_value"),
+                    "source_dif_column": metric_map.get("dif"),
+                    "source_rel_column": metric_map.get("rel"),
                     "compare_source": metadata["compare_source"],
                     "process": metadata["process"],
                     "process_version": metadata["process_version"],
@@ -224,11 +237,12 @@ def _warning(path, row_index, arc_original, arc, analysis_type, metric, code, me
 def load_normalized_data(data_dir, corners=None, types=None, column_mapping=None):
     """Load all Phase 1 rpt files and return normalized, manifest, warnings DataFrames."""
     config = load_column_mapping(column_mapping)
+    input_root = Path(data_dir).resolve()
     all_rows = []
     manifest_rows = []
     warning_rows = []
 
-    for path in sorted(Path(data_dir).glob("*.rpt")):
+    for path in sorted(input_root.glob("*.rpt")):
         metadata = parse_phase1_filename(path, config)
         if metadata is None:
             continue
@@ -236,13 +250,15 @@ def load_normalized_data(data_dir, corners=None, types=None, column_mapping=None
             continue
         if types is not None and metadata["analysis_type"] not in types:
             continue
-        rows, manifest, warnings = _normalize_file(path, config)
+        rows, manifest, warnings = _normalize_file(path, config, input_root)
         all_rows.extend(rows)
         if manifest:
             manifest_rows.append(manifest)
         warning_rows.extend(warnings)
 
     normalized = pd.DataFrame(all_rows)
+    if not normalized.empty:
+        normalized["trace_id"] = [f"norm-{idx + 1:08d}" for idx in range(len(normalized))]
     if not normalized.empty:
         normalized["is_optimistic_risk"] = normalized["is_optimistic_risk"].astype(object)
         normalized["has_real_ci"] = normalized["has_real_ci"].astype(object)
