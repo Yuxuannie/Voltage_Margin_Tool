@@ -160,24 +160,25 @@ Matching uses canonical `arc` only. FMC arcs ending in `_N_M` are normalized to
 Phase 1 sensitivity uses source-library values from the compare report's Lib
 side. It does not use MC values for sensitivity.
 
-The method is one multi-voltage linear fit per
+The method is an adjacent-pair local slope per
 `(compare_source, process, process_version, analysis_type, metric, arc,
 corner_family, temperature_c)` group:
 
 ```text
-slope_ps_per_v = linear_fit(voltage_v, lib_value_ps).slope
+slope_ps_per_v = (lib_high_ps - lib_low_ps) / (v_high - v_low)
 sensitivity_ps_per_mv = abs(slope_ps_per_v) / 1000
 ```
 
-The tool emits one sensitivity row per target corner when at least two voltage
-points are available. Rows with fewer than two voltage points are skipped with a
-warning.
+Boundary target corners emit one sensitivity row using the only adjacent pair.
+Intermediate target corners emit two rows, `lower_pair` and `upper_pair`.
+Rows with fewer than two voltage points are skipped with a warning.
 
 `sensitivity/sensitivity.csv` columns:
 
 ```text
 process, process_version, compare_source, analysis_type, metric, arc,
 corner_family, temperature_c, corner, voltage_v,
+pair_v_low, pair_v_high, pair_role,
 voltage_values_v, lib_values_ps,
 slope_ps_per_v, sensitivity_ps_per_mv,
 intercept_ps, fit_r2, valid_points, fit_status, warning

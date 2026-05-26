@@ -185,7 +185,7 @@ def test_policy_thresholds_use_ps_floors_and_hold_metric_set():
     assert get_all_params_for_type("hold") == ["Late_Sigma", "Nominal"]
 
 
-def test_sensitivity_uses_single_multivoltage_fit_for_target_corner():
+def test_sensitivity_uses_adjacent_pair_local_slope_for_target_corner():
     arc = "combinational_CELL_Z_rise_A_rise_NO_CONDITION_4-4"
     normalized = pd.DataFrame(
         [
@@ -249,26 +249,38 @@ def test_sensitivity_uses_single_multivoltage_fit_for_target_corner():
     sensitivity, warnings = build_sensitivity_rows(normalized, load_policy())
 
     assert warnings.empty
-    assert len(sensitivity) == 3
+    assert len(sensitivity) == 4
+    assert {"pair_v_low", "pair_v_high", "pair_role"}.issubset(sensitivity.columns)
+    assert (sensitivity["valid_points"] == 2).all()
+
+    first = sensitivity[sensitivity["corner"] == "ssgnp_0p450v_m40c"].iloc[0]
+    assert first["pair_role"] == "only_pair"
+    assert math.isclose(first["pair_v_low"], 0.450)
+    assert math.isclose(first["pair_v_high"], 0.465)
+    assert math.isclose(first["sensitivity_ps_per_mv"], 2.0)
 
     middle = sensitivity[sensitivity["corner"] == "ssgnp_0p465v_m40c"]
-    assert len(middle) == 1
-    assert middle.iloc[0]["valid_points"] == 3
-    assert math.isclose(middle.iloc[0]["sensitivity_ps_per_mv"], 3.0)
-    assert 0.96 < middle.iloc[0]["fit_r2"] < 0.97
+    assert middle["pair_role"].tolist() == ["lower_pair", "upper_pair"]
+    assert all(
+        math.isclose(actual, expected)
+        for actual, expected in zip(middle["sensitivity_ps_per_mv"], [2.0, 4.0])
+    )
 
     margins = build_margin_outputs(normalized, sensitivity, load_policy())
     optimistic = margins.optimistic_only_per_object
     assert set(optimistic["corner"]) == {"ssgnp_0p465v_m40c", "ssgnp_0p480v_m40c"}
     mid_margins = optimistic[optimistic["corner"] == "ssgnp_0p465v_m40c"]
-    assert len(mid_margins) == 1
-    assert math.isclose(mid_margins.iloc[0]["required_margin_mv"], 2.0)
+    assert len(mid_margins) == 2
+    assert all(
+        math.isclose(actual, expected)
+        for actual, expected in zip(mid_margins["required_margin_mv"], [3.0, 1.5])
+    )
 
     mid_summary = margins.optimistic_only_summary[
         margins.optimistic_only_summary["corner"] == "ssgnp_0p465v_m40c"
     ].iloc[0]
     assert mid_summary["aggregation"] == "per_object"
-    assert math.isclose(mid_summary["max_margin_mv"], 2.0)
+    assert math.isclose(mid_summary["max_margin_mv"], 3.0)
 
 
 def test_margin_output_skips_rows_when_sensitivity_has_insufficient_voltage_points():

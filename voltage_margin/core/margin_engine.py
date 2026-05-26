@@ -31,6 +31,9 @@ SENSITIVITY_COLUMNS = [
     "temperature_c",
     "corner",
     "voltage_v",
+    "pair_v_low",
+    "pair_v_high",
+    "pair_role",
     "voltage_values_v",
     "lib_values_ps",
     "valid_points",
@@ -89,7 +92,7 @@ def _linear_fit(voltages, values):
 
 
 def build_sensitivity_rows(normalized_rows, policy=None):
-    """Build per-target-corner sensitivities from a multi-voltage linear fit."""
+    """Build per-target-corner sensitivities from adjacent voltage pairs."""
     if policy is None:
         policy = load_policy()
 
@@ -134,32 +137,55 @@ def build_sensitivity_rows(normalized_rows, policy=None):
             )
             continue
 
-        slope, intercept, r_squared = _linear_fit(available, lib_values)
         target_rows = (
             group_data[["corner", "voltage_v"]]
             .drop_duplicates()
             .sort_values(["voltage_v", "corner"])
         )
         for _, target in target_rows.iterrows():
-            rows.append(
-                {
-                    **metadata,
-                    "corner": target["corner"],
-                    "voltage_v": float(target["voltage_v"]),
-                    "voltage_values_v": ";".join(f"{v:g}" for v in available),
-                    "lib_values_ps": ";".join(f"{v:g}" for v in lib_values),
-                    "valid_points": len(available),
-                    "slope_ps_per_v": slope,
-                    "sensitivity_ps_per_mv": abs(slope) / 1000.0,
-                    "intercept_ps": intercept,
-                    "fit_r2": r_squared,
-                    "fit_status": "ok",
-                    "warning": "",
-                }
-            )
+            target_voltage = float(target["voltage_v"])
+            target_index = available.index(target_voltage)
+            for low_index, high_index, role in _adjacent_pairs_for_index(
+                target_index, len(available)
+            ):
+                pair_voltages = [available[low_index], available[high_index]]
+                pair_values = [lib_values[low_index], lib_values[high_index]]
+                slope, intercept, r_squared = _linear_fit(pair_voltages, pair_values)
+                rows.append(
+                    {
+                        **metadata,
+                        "corner": target["corner"],
+                        "voltage_v": target_voltage,
+                        "pair_v_low": pair_voltages[0],
+                        "pair_v_high": pair_voltages[1],
+                        "pair_role": role,
+                        "voltage_values_v": ";".join(f"{v:g}" for v in pair_voltages),
+                        "lib_values_ps": ";".join(f"{v:g}" for v in pair_values),
+                        "valid_points": len(pair_voltages),
+                        "slope_ps_per_v": slope,
+                        "sensitivity_ps_per_mv": abs(slope) / 1000.0,
+                        "intercept_ps": intercept,
+                        "fit_r2": r_squared,
+                        "fit_status": "ok",
+                        "warning": "",
+                    }
+                )
 
     return pd.DataFrame(rows, columns=SENSITIVITY_COLUMNS), pd.DataFrame(
         warnings, columns=SENSITIVITY_WARNING_COLUMNS)
+
+
+def _adjacent_pairs_for_index(index, length):
+    if length == 2:
+        return [(0, 1, "only_pair")]
+    if index == 0:
+        return [(0, 1, "only_pair")]
+    if index == length - 1:
+        return [(length - 2, length - 1, "only_pair")]
+    return [
+        (index - 1, index, "lower_pair"),
+        (index, index + 1, "upper_pair"),
+    ]
 
 
 def build_margin_outputs(normalized_rows, sensitivity_rows, policy=None):
@@ -235,6 +261,9 @@ def build_margin_outputs(normalized_rows, sensitivity_rows, policy=None):
                 "is_optimistic_risk": bool(row.get("is_optimistic_risk")),
                 "voltage_values_v": row.get("voltage_values_v"),
                 "lib_values_ps": row.get("lib_values_ps"),
+                "pair_v_low": row.get("pair_v_low"),
+                "pair_v_high": row.get("pair_v_high"),
+                "pair_role": row.get("pair_role"),
                 "sensitivity_ps_per_mv": sensitivity,
                 "slope_ps_per_v": row.get("slope_ps_per_v"),
                 "intercept_ps": row.get("intercept_ps"),
