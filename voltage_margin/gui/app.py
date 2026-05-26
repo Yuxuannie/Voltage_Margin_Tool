@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shlex
 import webbrowser
 from pathlib import Path
 import tkinter as tk
@@ -12,13 +13,15 @@ import pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 from ..core.config_loader import DEFAULT_COLUMN_MAPPING, DEFAULT_POLICY
-from ..visualization.plots import plot_pass_rate_bars
 from .phase1_backend import (
     OutputTables,
     Phase1RunConfig,
+    build_target_margin_plan,
+    enrich_margin_rows,
     filter_margins,
     format_margin_trace_detail,
     load_output_package,
+    read_source_context,
     read_source_line,
     run_phase1_pipeline,
     summarize_margins,
@@ -28,6 +31,24 @@ from .phase1_backend import (
 
 logger = logging.getLogger(__name__)
 
+
+TARGET_COLUMNS = [
+    "compare_source",
+    "corner",
+    "analysis_type",
+    "required_margin_mv",
+    "target_coverage_pct",
+    "coverage_pct",
+    "covered_rows",
+    "valid_rows",
+    "skipped_rows",
+    "worst_margin_mv",
+    "worst_metric",
+    "worst_arc",
+    "worst_source_file_relative",
+    "worst_source_line_number",
+    "worst_margin_trace_id",
+]
 
 PASS_RATE_COLUMNS = [
     "Corner",
@@ -132,6 +153,8 @@ class VoltageMarginApp:
         }
         self.selected_margin_detail = {}
         self.tables: OutputTables | None = None
+        self.margin_rows = pd.DataFrame()
+        self.target_plan = pd.DataFrame()
         self.display_frames = {}
         self.display_trees = {}
         self.display_dfs = {}
@@ -216,9 +239,9 @@ class VoltageMarginApp:
         kpi_bar = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         kpi_bar.pack(fill="x")
         specs = [
-            ("Voltage Margin Rows", "margins"),
-            ("OK Margins", "ok"),
-            ("Need Review", "review"),
+            ("Margin Rows", "margins"),
+            ("OK", "ok"),
+            ("Review", "review"),
             ("Trace Links", "trace"),
         ]
         for idx, (label, key) in enumerate(specs):
@@ -284,7 +307,7 @@ class VoltageMarginApp:
     def _build_notebook(self, parent):
         self.notebook = ttk.Notebook(parent)
         self.notebook.pack(fill="both", expand=True)
-        for name in ["Pass Rate", "Margins", "Sensitivity", "Warnings", "Trace"]:
+        for name in ["95% Target", "Margins", "Pass Rate", "Sensitivity", "Warnings", "Trace"]:
             frame = ttk.Frame(self.notebook, style="Panel.TFrame")
             self.notebook.add(frame, text=name)
             self._build_table_tab(name, frame)
@@ -292,7 +315,7 @@ class VoltageMarginApp:
         plot_frame = ttk.Frame(self.notebook, style="Panel.TFrame")
         self.notebook.add(plot_frame, text="Plots")
         self._build_plot_tab(plot_frame)
-        self.notebook.select(1)
+        self.notebook.select(0)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _build_table_tab(self, name, frame):
@@ -332,9 +355,12 @@ class VoltageMarginApp:
                   font=("Helvetica", 11, "bold")).pack(side="left", anchor="w")
         ttk.Button(top, text="Copy path:line", command=self._copy_path_line).pack(
             side="right", padx=(6, 0))
+        ttk.Button(top, text="Copy less command", command=self._copy_less_command).pack(
+            side="right", padx=(6, 0))
         ttk.Button(top, text="Open Source", command=self._open_source_file).pack(
             side="right", padx=(6, 0))
-        ttk.Button(top, text="Show Raw Row", command=self._show_raw_row).pack(side="right")
+        ttk.Button(top, text="Show Source Context", command=self._show_raw_row).pack(
+            side="right")
 
         self.path_line_value = ttk.Label(
             parent,
@@ -405,6 +431,9 @@ class VoltageMarginApp:
                 )
             )
             self.tables = load_output_package(result.output_dir)
+            self.margin_rows = enrich_margin_rows(
+                self.tables.all_margins, self.tables.sensitivity)
+            self.target_plan = build_target_margin_plan(self.margin_rows)
             self.summary_var.set(
                 f"{result.parameter_groups} groups, {result.total_arcs} arcs")
             self._refresh_all_tables()
@@ -421,6 +450,7 @@ class VoltageMarginApp:
     def _refresh_all_tables(self):
         if self.tables is None:
             return
+        self._populate_table("95% Target", self.target_plan, TARGET_COLUMNS)
         self._populate_table("Pass Rate", self.tables.pass_rate, PASS_RATE_COLUMNS)
         self._apply_margin_filters()
         self._populate_table("Sensitivity", self.tables.sensitivity, SENSITIVITY_COLUMNS)
@@ -430,7 +460,7 @@ class VoltageMarginApp:
     def _refresh_kpis(self):
         if self.tables is None:
             return
-        summary = summarize_margins(self.tables.all_margins, self.tables.margin_trace)
+        summary = summarize_margins(self.margin_rows, self.tables.margin_trace)
         self.kpi_vars["margins"].set(str(summary.total_margins))
         self.kpi_vars["ok"].set(str(summary.ok_margins))
         self.kpi_vars["review"].set(str(summary.needs_review))
@@ -453,7 +483,7 @@ class VoltageMarginApp:
     def _refresh_filter_options(self):
         if self.tables is None:
             return
-        margins = self.tables.all_margins
+        margins = self.margin_rows
         mapping = {
             "source": "compare_source",
             "type": "analysis_type",
@@ -476,7 +506,7 @@ class VoltageMarginApp:
         if self.tables is None:
             return
         filtered = filter_margins(
-            self.tables.all_margins,
+            self.margin_rows,
             source=self.filter_vars["source"].get(),
             analysis_type=self.filter_vars["type"].get(),
             metric=self.filter_vars["metric"].get(),
@@ -484,8 +514,15 @@ class VoltageMarginApp:
             status=self.filter_vars["status"].get(),
         )
         self._populate_table("Margins", filtered, MARGIN_COLUMNS)
+        self._populate_table(
+            "95% Target",
+            build_target_margin_plan(filtered),
+            TARGET_COLUMNS,
+        )
         if self.current_tab_name == "Margins":
             self._select_first_margin()
+        if self.current_tab_name in {"95% Target", "Plots"}:
+            self._update_plot()
 
     def _populate_table(self, name, df, preferred_columns):
         tree = self.display_trees[name]
@@ -494,7 +531,7 @@ class VoltageMarginApp:
         tree["columns"] = columns
         for column in columns:
             tree.heading(column, text=column, command=lambda c=column, n=name: self._sort_table(n, c))
-            width = 230 if column in {"arc", "source_file", "source_file_relative"} else 120
+            width = 280 if column in {"arc", "worst_arc"} else 180 if "source" in column else 120
             tree.column(column, width=width, minwidth=70, anchor="w")
         if df.empty:
             self.display_dfs[name] = df
@@ -507,9 +544,9 @@ class VoltageMarginApp:
             tree.insert("", "end", iid=str(idx), values=values, tags=tags)
 
     def _row_tags(self, name, row):
-        if name != "Margins":
+        if name not in {"Margins", "95% Target"}:
             return ()
-        status = str(row.get("margin_status", "") or "")
+        status = str(row.get("margin_status", "") or "ok")
         if status == "ok":
             return ("ok",)
         if status:
@@ -536,19 +573,38 @@ class VoltageMarginApp:
         self.current_tab_name = self.notebook.tab(selected, "text")
 
     def _on_table_select(self, tab_name):
-        if tab_name != "Margins":
-            return
         tree = self.display_trees[tab_name]
         selected = tree.selection()
         if not selected:
             return
         row = self.display_dfs[tab_name].iloc[int(selected[0])]
-        self._show_margin_detail(row)
+        if tab_name == "Margins":
+            self._show_margin_detail(row)
+        elif tab_name == "95% Target":
+            self._show_target_detail(row)
 
     def _show_margin_workspace(self):
-        self.notebook.select(1)
-        self.current_tab_name = "Margins"
-        self._select_first_margin()
+        self.notebook.select(0)
+        self.current_tab_name = "95% Target"
+        self._select_first_target()
+
+    def _select_first_target(self):
+        tree = self.display_trees.get("95% Target")
+        if tree is None:
+            return
+        children = tree.get_children()
+        if not children:
+            self.trace_title_var.set("No 95% target margin rows available.")
+            self.path_line_var.set("")
+            self.selected_margin_detail = {}
+            self._write_trace_text("No target margin rows match the current filters.")
+            return
+        first = children[0]
+        tree.selection_set(first)
+        tree.focus(first)
+        tree.see(first)
+        row = self.display_dfs["95% Target"].iloc[int(first)]
+        self._show_target_detail(row)
 
     def _select_first_margin(self):
         tree = self.display_trees.get("Margins")
@@ -573,6 +629,13 @@ class VoltageMarginApp:
         self.selected_margin_detail = detail
         self.trace_title_var.set(detail["title"] or "Selected margin")
         self.path_line_var.set(detail["path_line"])
+        context = ""
+        if detail["source_file"] and detail["source_line_number"]:
+            try:
+                context = read_source_context(
+                    detail["source_file"], detail["source_line_number"], radius=2)
+            except Exception:
+                context = ""
         text = "\n".join(
             [
                 f"Arc: {detail['arc']}",
@@ -581,12 +644,39 @@ class VoltageMarginApp:
                 f"Sensitivity trace: {detail['sensitivity_trace_id']}",
                 f"Low sources: {detail['low_sources']}",
                 f"High sources: {detail['high_sources']}",
+                "",
+                "Source context:",
+                context,
             ]
         )
-        self.trace_text.configure(state="normal")
-        self.trace_text.delete("1.0", "end")
-        self.trace_text.insert("1.0", text)
-        self.trace_text.configure(state="disabled")
+        self._write_trace_text(text)
+
+    def _show_target_detail(self, row):
+        trace_id = str(row.get("worst_margin_trace_id", "") or "")
+        if trace_id and not self.margin_rows.empty and "margin_trace_id" in self.margin_rows.columns:
+            match = self.margin_rows[self.margin_rows["margin_trace_id"].astype(str) == trace_id]
+            if not match.empty:
+                self._show_margin_detail(match.iloc[0])
+                self.trace_title_var.set(
+                    f"95% target driver: {row.get('corner')} / {row.get('analysis_type')}"
+                )
+                return
+        self.trace_title_var.set(
+            f"95% target: {row.get('corner')} / {row.get('analysis_type')}")
+        self.path_line_var.set("")
+        self.selected_margin_detail = {}
+        self._write_trace_text(
+            "\n".join(
+                [
+                    f"Required margin for {row.get('target_coverage_pct'):.0f}%: "
+                    f"{row.get('required_margin_mv'):.6g} mV",
+                    f"Coverage: {row.get('covered_rows')} / {row.get('valid_rows')} rows",
+                    f"Worst row: {row.get('worst_margin_mv'):.6g} mV",
+                    f"Worst metric: {row.get('worst_metric')}",
+                    f"Worst arc: {row.get('worst_arc')}",
+                ]
+            )
+        )
 
     def _write_trace_text(self, text):
         self.trace_text.configure(state="normal")
@@ -601,6 +691,15 @@ class VoltageMarginApp:
             self.root.clipboard_append(path_line)
             self.status_var.set(f"Copied {path_line}")
 
+    def _copy_less_command(self):
+        source_file = self.selected_margin_detail.get("source_file", "")
+        line_number = self.selected_margin_detail.get("source_line_number", "")
+        if source_file and line_number:
+            command = f"less +{int(float(line_number))} {shlex.quote(source_file)}"
+            self.root.clipboard_clear()
+            self.root.clipboard_append(command)
+            self.status_var.set(f"Copied {command}")
+
     def _open_source_file(self):
         source_file = self.selected_margin_detail.get("source_file", "")
         if source_file and Path(source_file).exists():
@@ -614,11 +713,11 @@ class VoltageMarginApp:
         if not source_file or not line_number:
             return
         try:
-            raw = read_source_line(source_file, line_number)
+            raw = read_source_context(source_file, line_number, radius=3)
         except Exception as exc:
             messagebox.showerror("Could not read source row", str(exc))
             return
-        messagebox.showinfo("Raw Source Row", raw or "Line not found.")
+        messagebox.showinfo("Source Context", raw or "Line not found.")
 
     def _open_output_folder(self):
         output_dir = self.output_dir.get().strip()
@@ -640,10 +739,11 @@ class VoltageMarginApp:
             self.status_var.set(f"Exported {self.current_tab_name} to {path}")
 
     def _update_plot(self):
-        if self.tables is None or self.tables.pass_rate.empty:
+        if self.tables is None:
             return
         plt.close(self.current_fig)
-        self.current_fig = plot_pass_rate_bars(self.tables.pass_rate, title="Pass Rate Summary")
+        target_df = self.display_dfs.get("95% Target", self.target_plan)
+        self.current_fig = self._plot_target_margin_plan(target_df)
         self.canvas.get_tk_widget().destroy()
         self.toolbar.destroy()
         parent = self.notebook.nametowidget(self.notebook.tabs()[-1])
@@ -654,6 +754,39 @@ class VoltageMarginApp:
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
         self.toolbar.update()
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _plot_target_margin_plan(self, plan):
+        fig, ax = plt.subplots(figsize=(12, 6))
+        fig.patch.set_facecolor("#f8fafb")
+        ax.set_facecolor("#ffffff")
+        if plan is None or plan.empty:
+            ax.text(0.5, 0.5, "Run analysis to see 95% margin plan",
+                    ha="center", va="center", fontsize=13, color="#66717d")
+            ax.axis("off")
+            return fig
+        plot_df = plan.sort_values("required_margin_mv", ascending=True).tail(24)
+        labels = plot_df.apply(
+            lambda r: f"{r['corner']} / {r['analysis_type']} / {r['compare_source']}",
+            axis=1,
+        )
+        colors = ["#0b63ce" if value < 50 else "#c2410c"
+                  for value in plot_df["required_margin_mv"]]
+        bars = ax.barh(labels, plot_df["required_margin_mv"], color=colors, alpha=0.88)
+        for bar, value in zip(bars, plot_df["required_margin_mv"]):
+            ax.text(
+                bar.get_width() + max(plot_df["required_margin_mv"].max() * 0.01, 0.2),
+                bar.get_y() + bar.get_height() / 2,
+                f"{value:.2f} mV",
+                va="center",
+                fontsize=8,
+                color="#17212b",
+            )
+        ax.set_xlabel("Voltage margin required for >=95% coverage (mV)")
+        ax.set_title("95% Voltage Margin Requirement by Corner and Type")
+        ax.grid(axis="x", alpha=0.25)
+        ax.spines[["top", "right", "left"]].set_visible(False)
+        fig.tight_layout()
+        return fig
 
     def _save_plot(self):
         path = filedialog.asksaveasfilename(

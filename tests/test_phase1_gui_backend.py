@@ -4,9 +4,12 @@ import pandas as pd
 
 from voltage_margin.gui.phase1_backend import (
     Phase1RunConfig,
+    build_target_margin_plan,
+    enrich_margin_rows,
     filter_margins,
     format_margin_trace_detail,
     load_output_package,
+    read_source_context,
     read_source_line,
     run_phase1_pipeline,
     summarize_margins,
@@ -118,6 +121,84 @@ def test_filter_margins_filters_by_user_visible_fields():
     assert filtered.iloc[0]["compare_source"] == "fmc_compare"
 
 
+def test_build_target_margin_plan_answers_95_percent_by_corner_and_type():
+    margins = pd.DataFrame(
+        [
+            {
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Late_Sigma",
+                "arc": "a1",
+                "required_margin_mv": 1.0,
+                "margin_status": "ok",
+                "margin_trace_id": "m1",
+            },
+            {
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Skew",
+                "arc": "a2",
+                "required_margin_mv": 3.0,
+                "margin_status": "ok",
+                "margin_trace_id": "m2",
+            },
+            {
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Nominal",
+                "arc": "a3",
+                "required_margin_mv": 9.0,
+                "margin_status": "ok",
+                "margin_trace_id": "m3",
+            },
+            {
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "slew",
+                "metric": "Late_Sigma",
+                "arc": "s1",
+                "required_margin_mv": 2.0,
+                "margin_status": "ok",
+                "margin_trace_id": "s1",
+            },
+        ]
+    )
+
+    plan = build_target_margin_plan(margins, target_coverage=0.95)
+
+    delay = plan[plan["analysis_type"] == "delay"].iloc[0]
+    assert delay["required_margin_mv"] == 9.0
+    assert delay["covered_rows"] == 3
+    assert delay["valid_rows"] == 3
+    assert delay["coverage_pct"] == 100.0
+    assert delay["worst_metric"] == "Nominal"
+    assert delay["worst_margin_trace_id"] == "m3"
+
+
+def test_enrich_margin_rows_adds_sensitivity_sources_for_audit():
+    margins = pd.DataFrame(
+        [{"sensitivity_trace_id": "sens-1", "required_margin_mv": 2.0}]
+    )
+    sensitivity = pd.DataFrame(
+        [
+            {
+                "sensitivity_trace_id": "sens-1",
+                "low_source_refs_summary": "low.rpt:3",
+                "high_source_refs_summary": "high.rpt:3",
+                "sensitivity_formula": "sensitivity_ps_per_mv = abs(3 - 1) / 15",
+            }
+        ]
+    )
+
+    enriched = enrich_margin_rows(margins, sensitivity)
+
+    assert enriched.iloc[0]["low_source_refs_summary"] == "low.rpt:3"
+    assert "sensitivity_ps_per_mv" in enriched.iloc[0]["sensitivity_formula"]
+
+
 def test_summarize_margins_counts_status_and_trace_rows():
     margins = pd.DataFrame(
         [
@@ -171,3 +252,14 @@ def test_margin_trace_detail_and_source_line_lookup(tmp_path):
     assert "required_margin_mv" in detail["required_formula"]
     assert detail["low_sources"] == "low.rpt:3"
     assert read_source_line(source, 4) == "row-two"
+
+
+def test_read_source_context_marks_requested_line(tmp_path):
+    source = tmp_path / "source.rpt"
+    source.write_text("header\ncolumns\nrow-one\nrow-two\nrow-three\n")
+
+    context = read_source_context(source, 4, radius=1)
+
+    assert "   3 | row-one" in context
+    assert ">> 4 | row-two" in context
+    assert "   5 | row-three" in context

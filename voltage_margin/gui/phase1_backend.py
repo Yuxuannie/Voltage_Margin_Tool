@@ -1,6 +1,7 @@
 """Testable Phase 1 backend helpers for the Tkinter workbench."""
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Iterable
 
@@ -172,6 +173,89 @@ def filter_margins(
     return filtered
 
 
+def enrich_margin_rows(margins: pd.DataFrame, sensitivity: pd.DataFrame) -> pd.DataFrame:
+    if margins.empty or sensitivity.empty or "sensitivity_trace_id" not in margins.columns:
+        return margins.copy()
+    enrich_columns = [
+        "sensitivity_trace_id",
+        "low_source_refs_summary",
+        "high_source_refs_summary",
+        "sensitivity_formula",
+    ]
+    available = [column for column in enrich_columns if column in sensitivity.columns]
+    if available == ["sensitivity_trace_id"]:
+        return margins.copy()
+    lookup = sensitivity[available].drop_duplicates("sensitivity_trace_id")
+    return margins.merge(lookup, on="sensitivity_trace_id", how="left")
+
+
+def build_target_margin_plan(
+    margins: pd.DataFrame,
+    target_coverage: float = 0.95,
+    group_columns: Iterable[str] = ("compare_source", "corner", "analysis_type"),
+) -> pd.DataFrame:
+    group_columns = list(group_columns)
+    output_columns = group_columns + [
+        "target_coverage_pct",
+        "required_margin_mv",
+        "covered_rows",
+        "valid_rows",
+        "total_rows",
+        "skipped_rows",
+        "coverage_pct",
+        "worst_margin_mv",
+        "worst_metric",
+        "worst_arc",
+        "worst_source_file_relative",
+        "worst_source_line_number",
+        "worst_margin_trace_id",
+    ]
+    required = set(group_columns + ["required_margin_mv", "margin_status"])
+    if margins.empty or not required.issubset(margins.columns):
+        return pd.DataFrame(columns=output_columns)
+
+    rows = []
+    for group_key, group in margins.groupby(group_columns, dropna=False):
+        valid = group[
+            (group["margin_status"].astype(str) == "ok")
+            & pd.to_numeric(group["required_margin_mv"], errors="coerce").apply(math.isfinite)
+        ].copy()
+        valid["required_margin_mv"] = valid["required_margin_mv"].astype(float)
+        if valid.empty:
+            continue
+        ordered = valid.sort_values("required_margin_mv", kind="mergesort")
+        target_index = max(math.ceil(target_coverage * len(ordered)) - 1, 0)
+        target_row = ordered.iloc[target_index]
+        worst_row = ordered.iloc[-1]
+        covered = int((ordered["required_margin_mv"] <= target_row["required_margin_mv"]).sum())
+        rows.append(
+            {
+                **dict(zip(group_columns, group_key if isinstance(group_key, tuple) else (group_key,))),
+                "target_coverage_pct": target_coverage * 100.0,
+                "required_margin_mv": float(target_row["required_margin_mv"]),
+                "covered_rows": covered,
+                "valid_rows": len(valid),
+                "total_rows": len(group),
+                "skipped_rows": len(group) - len(valid),
+                "coverage_pct": covered / len(valid) * 100.0,
+                "worst_margin_mv": float(worst_row["required_margin_mv"]),
+                "worst_metric": str(worst_row.get("metric", "") or ""),
+                "worst_arc": str(worst_row.get("arc", "") or ""),
+                "worst_source_file_relative": str(
+                    worst_row.get("source_file_relative", "") or ""),
+                "worst_source_line_number": worst_row.get("source_line_number", ""),
+                "worst_margin_trace_id": str(worst_row.get("margin_trace_id", "") or ""),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=output_columns)
+    return pd.DataFrame(rows, columns=output_columns).sort_values(
+        ["required_margin_mv"] + group_columns,
+        ascending=[False] + [True] * len(group_columns),
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+
 def summarize_margins(margins: pd.DataFrame, margin_trace: pd.DataFrame) -> MarginSummary:
     if margins.empty:
         return MarginSummary(trace_rows=len(margin_trace))
@@ -217,6 +301,23 @@ def read_source_line(path: Path | str, line_number: int | str) -> str:
             if current == line_number:
                 return line.rstrip("\n")
     return ""
+
+
+def read_source_context(path: Path | str, line_number: int | str, radius: int = 2) -> str:
+    path = Path(path)
+    line_number = int(float(line_number))
+    start = max(line_number - radius, 1)
+    end = line_number + radius
+    lines = []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for current, line in enumerate(handle, start=1):
+            if current < start:
+                continue
+            if current > end:
+                break
+            marker = ">>" if current == line_number else "  "
+            lines.append(f"{marker} {current} | {line.rstrip()}")
+    return "\n".join(lines)
 
 
 def table_columns(df: pd.DataFrame, preferred: Iterable[str]) -> list[str]:
