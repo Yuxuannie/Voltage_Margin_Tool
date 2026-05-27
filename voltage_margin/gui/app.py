@@ -16,9 +16,11 @@ from ..core.config_loader import DEFAULT_COLUMN_MAPPING, DEFAULT_POLICY
 from .phase1_backend import (
     OutputTables,
     Phase1RunConfig,
+    build_margin_audit_rows,
     build_vm_sweep,
     build_vm_target_summary,
     enrich_margin_rows,
+    find_vm_observations,
     filter_margins,
     format_margin_trace_detail,
     load_output_package,
@@ -44,6 +46,9 @@ TARGET_COLUMNS = [
     "pass_rate_at_required_vm_pct",
     "fixed_count_at_required_vm",
     "new_fail_count_at_required_vm",
+    "best_vm_mv",
+    "best_pr_pct",
+    "trend",
     "total_count",
     "status",
 ]
@@ -60,6 +65,20 @@ VM_SWEEP_COLUMNS = [
     "total_count",
     "fixed_count",
     "new_fail_count",
+]
+
+OBSERVATION_COLUMNS = [
+    "observation_code",
+    "scope",
+    "compare_source",
+    "corner",
+    "analysis_type",
+    "metric",
+    "message",
+    "base_pr_pct",
+    "best_vm_mv",
+    "best_pr_pct",
+    "new_fail_count_at_best",
 ]
 
 PASS_RATE_COLUMNS = [
@@ -152,11 +171,12 @@ class VoltageMarginApp:
             "corner": tk.StringVar(value="All"),
             "status": tk.StringVar(value="All"),
         }
+        self.plot_type_var = tk.StringVar(value="Selected PR Curve")
         self.status_var = tk.StringVar(value="Ready. Select input and output folders.")
         self.summary_var = tk.StringVar(value="No run loaded.")
         self.trace_title_var = tk.StringVar(value="Select a margin row to inspect trace.")
         self.path_line_var = tk.StringVar(value="")
-        self.current_tab_name = "Margins"
+        self.current_tab_name = "95% Target"
         self.kpi_vars = {
             "margins": tk.StringVar(value="0"),
             "ok": tk.StringVar(value="0"),
@@ -168,6 +188,7 @@ class VoltageMarginApp:
         self.margin_rows = pd.DataFrame()
         self.vm_sweep = pd.DataFrame()
         self.target_plan = pd.DataFrame()
+        self.observations = pd.DataFrame()
         self.display_frames = {}
         self.display_trees = {}
         self.display_dfs = {}
@@ -290,6 +311,21 @@ class VoltageMarginApp:
             side="left", padx=(8, 0))
         ttk.Button(type_frame, text="Save Plot", command=self._save_plot).pack(
             side="left", padx=(8, 0))
+        ttk.Label(type_frame, text="Plot:").pack(side="left", padx=(18, 4))
+        plot_box = ttk.Combobox(
+            type_frame,
+            textvariable=self.plot_type_var,
+            values=[
+                "Selected PR Curve",
+                "Target VM Ranking",
+                "Scope Difference",
+                "Observation Summary",
+            ],
+            state="readonly",
+            width=22,
+        )
+        plot_box.pack(side="left")
+        plot_box.bind("<<ComboboxSelected>>", lambda _event: self._update_plot())
         ttk.Label(type_frame, textvariable=self.summary_var, style="Muted.TLabel").pack(
             side="left", padx=(18, 0))
 
@@ -320,7 +356,16 @@ class VoltageMarginApp:
     def _build_notebook(self, parent):
         self.notebook = ttk.Notebook(parent)
         self.notebook.pack(fill="both", expand=True)
-        for name in ["95% Target", "VM Sweep", "Margins", "Pass Rate", "Sensitivity", "Warnings", "Trace"]:
+        for name in [
+            "95% Target",
+            "Observations",
+            "VM Sweep",
+            "Margins",
+            "Pass Rate",
+            "Sensitivity",
+            "Warnings",
+            "Trace",
+        ]:
             frame = ttk.Frame(self.notebook, style="Panel.TFrame")
             self.notebook.add(frame, text=name)
             self._build_table_tab(name, frame)
@@ -448,6 +493,7 @@ class VoltageMarginApp:
                 self.tables.all_margins, self.tables.sensitivity, self.tables.per_arc)
             self.vm_sweep = build_vm_sweep(self.margin_rows, max_margin_mv=50, step_mv=1)
             self.target_plan = build_vm_target_summary(self.vm_sweep)
+            self.observations = find_vm_observations(self.vm_sweep)
             self.summary_var.set(
                 f"{result.parameter_groups} groups, {result.total_arcs} arcs")
             self._refresh_all_tables()
@@ -465,6 +511,7 @@ class VoltageMarginApp:
         if self.tables is None:
             return
         self._populate_table("95% Target", self.target_plan, TARGET_COLUMNS)
+        self._populate_table("Observations", self.observations, OBSERVATION_COLUMNS)
         self._populate_table("VM Sweep", self.vm_sweep, VM_SWEEP_COLUMNS)
         self._populate_table("Pass Rate", self.tables.pass_rate, PASS_RATE_COLUMNS)
         self._apply_margin_filters()
@@ -528,18 +575,42 @@ class VoltageMarginApp:
             corner=self.filter_vars["corner"].get(),
             status=self.filter_vars["status"].get(),
         )
-        self._populate_table("Margins", filtered, MARGIN_COLUMNS)
-        filtered_sweep = build_vm_sweep(filtered, max_margin_mv=50, step_mv=1)
+        self._populate_table("Margins", build_margin_audit_rows(filtered), MARGIN_COLUMNS)
+        filtered_sweep = self._filtered_sweep_from_filters()
         self._populate_table(
             "95% Target",
             build_vm_target_summary(filtered_sweep),
             TARGET_COLUMNS,
         )
         self._populate_table("VM Sweep", filtered_sweep, VM_SWEEP_COLUMNS)
+        self._populate_table(
+            "Observations",
+            self._filter_group_table(self.observations),
+            OBSERVATION_COLUMNS,
+        )
         if self.current_tab_name == "Margins":
             self._select_first_margin()
-        if self.current_tab_name in {"95% Target", "VM Sweep", "Plots"}:
+        if self.current_tab_name in {"95% Target", "Observations", "VM Sweep", "Plots"}:
             self._update_plot()
+
+    def _filtered_sweep_from_filters(self):
+        return self._filter_group_table(self.vm_sweep)
+
+    def _filter_group_table(self, df):
+        if df.empty:
+            return df
+        filtered = df.copy()
+        mapping = {
+            "source": "compare_source",
+            "type": "analysis_type",
+            "metric": "metric",
+            "corner": "corner",
+        }
+        for key, column in mapping.items():
+            value = self.filter_vars[key].get()
+            if value and value != "All" and column in filtered.columns:
+                filtered = filtered[filtered[column].astype(str) == str(value)]
+        return filtered
 
     def _populate_table(self, name, df, preferred_columns):
         tree = self.display_trees[name]
@@ -563,7 +634,7 @@ class VoltageMarginApp:
     def _row_tags(self, name, row):
         if name not in {"Margins", "95% Target"}:
             return ()
-        status = str(row.get("margin_status", "") or "ok")
+        status = str(row.get("margin_status", "") or row.get("status", "") or "ok")
         if status == "ok":
             return ("ok",)
         if status:
@@ -599,6 +670,8 @@ class VoltageMarginApp:
             self._show_margin_detail(row)
         elif tab_name == "95% Target":
             self._show_target_detail(row)
+        elif tab_name == "Observations":
+            self._show_observation_detail(row)
 
     def _show_margin_workspace(self):
         self.notebook.select(0)
@@ -682,12 +755,34 @@ class VoltageMarginApp:
                     f"Base PR: {row.get('base_pr_pct'):.3g}%",
                     f"Required VM to reach 95% PR: {required_text}",
                     f"PR at required VM: {row.get('pass_rate_at_required_vm_pct'):.3g}%",
+                    f"Best VM in sweep: {row.get('best_vm_mv'):.0f} mV",
+                    f"Best PR in sweep: {row.get('best_pr_pct'):.3g}%",
+                    f"Trend: {row.get('trend')}",
                     f"Fixed outliers at required VM: {row.get('fixed_count_at_required_vm')}",
                     f"New fails at required VM: {row.get('new_fail_count_at_required_vm')}",
                     "",
                     "Scope meaning:",
                     "all_rows applies VM to every row, so pessimistic rows can become new fails.",
                     "outliers_only applies VM only to base failing rows and holds base passing rows fixed.",
+                ]
+            )
+        )
+
+    def _show_observation_detail(self, row):
+        self.trace_title_var.set(
+            f"Observation: {row.get('corner')} / {row.get('analysis_type')} / {row.get('metric')}"
+        )
+        self.path_line_var.set("")
+        self.selected_margin_detail = {}
+        self._write_trace_text(
+            "\n".join(
+                [
+                    f"{row.get('observation_code')}: {row.get('message')}",
+                    f"Scope: {row.get('scope')}",
+                    f"Base PR: {row.get('base_pr_pct'):.3g}%",
+                    f"Best VM: {row.get('best_vm_mv'):.0f} mV",
+                    f"Best PR: {row.get('best_pr_pct'):.3g}%",
+                    f"New fails at best VM: {row.get('new_fail_count_at_best')}",
                 ]
             )
         )
@@ -757,7 +852,9 @@ class VoltageMarginApp:
             return
         plt.close(self.current_fig)
         target_df = self.display_dfs.get("95% Target", self.target_plan)
-        self.current_fig = self._plot_vm_target(target_df)
+        sweep_df = self.display_dfs.get("VM Sweep", self.vm_sweep)
+        observations_df = self.display_dfs.get("Observations", self.observations)
+        self.current_fig = self._build_selected_plot(target_df, sweep_df, observations_df)
         self.canvas.get_tk_widget().destroy()
         self.toolbar.destroy()
         parent = self.notebook.nametowidget(self.notebook.tabs()[-1])
@@ -768,6 +865,16 @@ class VoltageMarginApp:
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
         self.toolbar.update()
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _build_selected_plot(self, plan, sweep, observations):
+        plot_type = self.plot_type_var.get()
+        if plot_type == "Target VM Ranking":
+            return self._plot_vm_target(plan)
+        if plot_type == "Scope Difference":
+            return self._plot_scope_difference(plan)
+        if plot_type == "Observation Summary":
+            return self._plot_observation_summary(observations)
+        return self._plot_selected_pr_curve(plan, sweep)
 
     def _plot_vm_target(self, plan):
         fig, ax = plt.subplots(figsize=(12, 6))
@@ -810,6 +917,117 @@ class VoltageMarginApp:
         ax.set_title("All Rows VM Sweep: Minimum VM to Reach 95% Pass Rate")
         ax.grid(axis="x", alpha=0.25)
         ax.spines[["top", "right", "left"]].set_visible(False)
+        fig.tight_layout()
+        return fig
+
+    def _selected_target_key(self, plan):
+        tree = self.display_trees.get("95% Target")
+        if tree is not None and tree.selection():
+            row = self.display_dfs["95% Target"].iloc[int(tree.selection()[0])]
+        elif plan is not None and not plan.empty:
+            row = plan.iloc[0]
+        else:
+            return None
+        return {
+            "compare_source": row.get("compare_source"),
+            "corner": row.get("corner"),
+            "analysis_type": row.get("analysis_type"),
+            "metric": row.get("metric"),
+        }
+
+    def _plot_selected_pr_curve(self, plan, sweep):
+        fig, ax = plt.subplots(figsize=(12, 6))
+        fig.patch.set_facecolor("#f8fafb")
+        ax.set_facecolor("#ffffff")
+        key = self._selected_target_key(plan)
+        if key is None or sweep is None or sweep.empty:
+            ax.text(0.5, 0.5, "Select a 95% Target row to plot VM sweep",
+                    ha="center", va="center", fontsize=13, color="#66717d")
+            ax.axis("off")
+            return fig
+        df = sweep.copy()
+        for column, value in key.items():
+            df = df[df[column].astype(str) == str(value)]
+        if df.empty:
+            ax.text(0.5, 0.5, "No sweep rows for selected target",
+                    ha="center", va="center", fontsize=13, color="#66717d")
+            ax.axis("off")
+            return fig
+        colors = {"all_rows": "#c2410c", "outliers_only": "#0b63ce"}
+        for scope, group in df.groupby("scope"):
+            group = group.sort_values("margin_mv")
+            ax.plot(
+                group["margin_mv"],
+                group["pass_rate_pct"],
+                marker="o",
+                linewidth=2,
+                markersize=3,
+                label=scope,
+                color=colors.get(scope, None),
+            )
+        ax.axhline(95.0, color="#166534", linestyle="--", linewidth=1.2, label="95% target")
+        ax.set_ylim(0, 105)
+        ax.set_xlabel("Applied voltage margin (mV)")
+        ax.set_ylabel("Pass rate (%)")
+        ax.set_title(
+            f"PR vs VM: {key['corner']} / {key['analysis_type']} / {key['metric']}")
+        ax.grid(alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        return fig
+
+    def _plot_scope_difference(self, plan):
+        fig, ax = plt.subplots(figsize=(12, 6))
+        fig.patch.set_facecolor("#f8fafb")
+        ax.set_facecolor("#ffffff")
+        if plan is None or plan.empty:
+            ax.text(0.5, 0.5, "No target data", ha="center", va="center")
+            ax.axis("off")
+            return fig
+        pivot = plan.pivot_table(
+            index=["compare_source", "corner", "analysis_type", "metric"],
+            columns="scope",
+            values="best_pr_pct",
+            aggfunc="first",
+        ).reset_index()
+        if not {"all_rows", "outliers_only"}.issubset(pivot.columns):
+            ax.text(0.5, 0.5, "Need both scopes for difference plot", ha="center", va="center")
+            ax.axis("off")
+            return fig
+        pivot["delta_pct"] = pivot["outliers_only"] - pivot["all_rows"]
+        plot_df = pivot.sort_values("delta_pct", ascending=True).tail(24)
+        labels = plot_df.apply(
+            lambda r: f"{r['corner']} / {r['analysis_type']} / {r['metric']}",
+            axis=1,
+        )
+        bars = ax.barh(labels, plot_df["delta_pct"], color="#7c3aed", alpha=0.85)
+        for bar, value in zip(bars, plot_df["delta_pct"]):
+            ax.text(bar.get_width() + 0.2, bar.get_y() + bar.get_height() / 2,
+                    f"{value:.1f}pp", va="center", fontsize=8)
+        ax.set_xlabel("Best PR difference: outliers_only - all_rows (percentage points)")
+        ax.set_title("Where outliers-only is much more optimistic than all-rows")
+        ax.grid(axis="x", alpha=0.25)
+        ax.spines[["top", "right", "left"]].set_visible(False)
+        fig.tight_layout()
+        return fig
+
+    def _plot_observation_summary(self, observations):
+        fig, ax = plt.subplots(figsize=(10, 5))
+        fig.patch.set_facecolor("#f8fafb")
+        ax.set_facecolor("#ffffff")
+        if observations is None or observations.empty:
+            ax.text(0.5, 0.5, "No observations under current filters",
+                    ha="center", va="center", fontsize=13, color="#66717d")
+            ax.axis("off")
+            return fig
+        counts = observations["observation_code"].value_counts()
+        bars = ax.bar(counts.index, counts.values, color=["#c2410c", "#0b63ce", "#7c3aed"])
+        for bar, value in zip(bars, counts.values):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.2,
+                    str(value), ha="center", va="bottom")
+        ax.set_ylabel("Groups")
+        ax.set_title("Automatic VM Sweep Observations")
+        ax.grid(axis="y", alpha=0.2)
         fig.tight_layout()
         return fig
 

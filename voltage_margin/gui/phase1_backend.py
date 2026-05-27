@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
 from voltage_margin.core.config_loader import (
@@ -219,6 +220,14 @@ def _truthy(value) -> bool:
     return bool(value)
 
 
+def _truthy_series(series: pd.Series) -> pd.Series:
+    if series.empty:
+        return pd.Series(dtype=bool)
+    if series.dtype == object:
+        return series.astype(str).str.lower().isin(["true", "1", "yes"])
+    return series.fillna(False).astype(bool)
+
+
 def _finite(value):
     numeric = pd.to_numeric(value, errors="coerce")
     try:
@@ -261,6 +270,38 @@ def _ci_pass(row, adjusted_dif) -> bool:
     return lower <= adjusted_lib <= upper
 
 
+def _numeric_series(df: pd.DataFrame, column: str, default=np.nan) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(default, index=df.index, dtype=float)
+    return pd.to_numeric(df[column], errors="coerce")
+
+
+def _base_pass_series(group: pd.DataFrame) -> pd.Series:
+    if "base_pass" in group.columns:
+        return _truthy_series(group["base_pass"]).reindex(group.index, fill_value=False)
+    return group.apply(_base_pass, axis=1)
+
+
+def _pass_series_with_vm(group: pd.DataFrame, margin_mv: int | float) -> pd.Series:
+    dif = _numeric_series(group, "dif_ps")
+    sensitivity = _numeric_series(group, "sensitivity_ps_per_mv").fillna(0.0)
+    adjusted_dif = dif + margin_mv * sensitivity
+    mc = _numeric_series(group, "mc_value_ps")
+    rel_threshold = _numeric_series(group, "rel_threshold")
+    abs_threshold = _numeric_series(group, "abs_threshold_ps")
+    rel_err = (adjusted_dif / mc.abs()).replace([np.inf, -np.inf], np.nan)
+    rel_pass = rel_err.abs() <= rel_threshold
+    abs_pass = adjusted_dif.abs() <= abs_threshold
+
+    ci_lb = _numeric_series(group, "mc_ci_lb_ps")
+    ci_ub = _numeric_series(group, "mc_ci_ub_ps")
+    lower = pd.concat([ci_lb, ci_ub], axis=1).min(axis=1)
+    upper = pd.concat([ci_lb, ci_ub], axis=1).max(axis=1)
+    adjusted_lib = mc + adjusted_dif
+    ci_pass = adjusted_lib.between(lower, upper)
+    return (rel_pass | abs_pass | ci_pass).fillna(False)
+
+
 def build_vm_sweep(
     margins: pd.DataFrame,
     max_margin_mv: int = 10,
@@ -287,19 +328,11 @@ def build_vm_sweep(
     rows = []
     for group_key, group in margins.groupby(group_columns, dropna=False):
         group_values = dict(zip(group_columns, group_key if isinstance(group_key, tuple) else (group_key,)))
-        base_passes = group.apply(_base_pass, axis=1)
+        base_passes = _base_pass_series(group)
         base_pass_count = int(base_passes.sum())
         total = len(group)
         for margin_mv in margin_points:
-            simulated = []
-            for idx, row in group.iterrows():
-                dif = _finite(row.get("dif_ps"))
-                sensitivity = _finite(row.get("sensitivity_ps_per_mv"))
-                adjusted_dif = dif
-                if dif is not None and sensitivity is not None:
-                    adjusted_dif = dif + margin_mv * sensitivity
-                simulated.append(_passes_with_dif(row, adjusted_dif))
-            simulated = pd.Series(simulated, index=group.index)
+            simulated = _pass_series_with_vm(group, margin_mv)
             for scope in ["all_rows", "outliers_only"]:
                 if scope == "outliers_only":
                     scoped_passes = base_passes | simulated
@@ -324,6 +357,21 @@ def build_vm_sweep(
     return pd.DataFrame(rows, columns=output_columns)
 
 
+def _trend_for_group(ordered: pd.DataFrame) -> str:
+    if ordered.empty:
+        return "unknown"
+    rates = ordered["pass_rate_pct"].astype(float)
+    if rates.is_monotonic_decreasing and rates.iloc[-1] < rates.iloc[0]:
+        return "declines"
+    best_index = rates.idxmax()
+    best_margin = ordered.loc[best_index, "margin_mv"]
+    if best_margin not in (ordered["margin_mv"].min(), ordered["margin_mv"].max()):
+        return "has_peak"
+    if rates.iloc[-1] > rates.iloc[0]:
+        return "improves"
+    return "flat"
+
+
 def build_vm_target_summary(
     sweep: pd.DataFrame,
     target_pass_rate_pct: float = 95.0,
@@ -336,6 +384,9 @@ def build_vm_target_summary(
         "pass_rate_at_required_vm_pct",
         "fixed_count_at_required_vm",
         "new_fail_count_at_required_vm",
+        "best_vm_mv",
+        "best_pr_pct",
+        "trend",
         "total_count",
         "status",
     ]
@@ -349,13 +400,14 @@ def build_vm_target_summary(
         base_pr = float(base_rows.iloc[0]["pass_rate_pct"]) if not base_rows.empty else 0.0
         reaching = ordered[ordered["pass_rate_pct"] >= target_pass_rate_pct]
         if reaching.empty:
-            selected = ordered.iloc[-1]
+            selected = ordered.loc[ordered["pass_rate_pct"].astype(float).idxmax()]
             status = "not_reached"
             required_vm = None
         else:
             selected = reaching.iloc[0]
             status = "ok"
             required_vm = selected["margin_mv"]
+        best = ordered.loc[ordered["pass_rate_pct"].astype(float).idxmax()]
         rows.append(
             {
                 **dict(zip(group_columns, group_key if isinstance(group_key, tuple) else (group_key,))),
@@ -365,6 +417,9 @@ def build_vm_target_summary(
                 "pass_rate_at_required_vm_pct": float(selected["pass_rate_pct"]),
                 "fixed_count_at_required_vm": int(selected["fixed_count"]),
                 "new_fail_count_at_required_vm": int(selected["new_fail_count"]),
+                "best_vm_mv": best["margin_mv"],
+                "best_pr_pct": float(best["pass_rate_pct"]),
+                "trend": _trend_for_group(ordered),
                 "total_count": int(selected["total_count"]),
                 "status": status,
             }
@@ -375,6 +430,73 @@ def build_vm_target_summary(
         kind="mergesort",
         na_position="last",
     ).reset_index(drop=True)
+
+
+def find_vm_observations(sweep: pd.DataFrame) -> pd.DataFrame:
+    group_columns = ["scope", "compare_source", "corner", "analysis_type", "metric"]
+    columns = [
+        *group_columns,
+        "observation_code",
+        "message",
+        "base_pr_pct",
+        "best_vm_mv",
+        "best_pr_pct",
+        "new_fail_count_at_best",
+    ]
+    if sweep.empty or not set(group_columns).issubset(sweep.columns):
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for group_key, group in sweep.groupby(group_columns, dropna=False):
+        ordered = group.sort_values("margin_mv", kind="mergesort")
+        base = ordered.iloc[0]
+        best = ordered.loc[ordered["pass_rate_pct"].astype(float).idxmax()]
+        values = dict(zip(group_columns, group_key if isinstance(group_key, tuple) else (group_key,)))
+        scope = values["scope"]
+        base_pr = float(base["pass_rate_pct"])
+        best_pr = float(best["pass_rate_pct"])
+        best_vm = best["margin_mv"]
+        if scope == "all_rows" and best_vm == base["margin_mv"] and best_pr >= float(ordered.iloc[-1]["pass_rate_pct"]):
+            if float(ordered.iloc[-1]["pass_rate_pct"]) < base_pr:
+                rows.append(
+                    {
+                        **values,
+                        "observation_code": "all_rows_degrades",
+                        "message": "All-rows VM reduces PR; pessimistic side creates new fails.",
+                        "base_pr_pct": base_pr,
+                        "best_vm_mv": best_vm,
+                        "best_pr_pct": best_pr,
+                        "new_fail_count_at_best": int(best["new_fail_count"]),
+                    }
+                )
+        if scope == "outliers_only" and best_vm not in (ordered["margin_mv"].min(), ordered["margin_mv"].max()):
+            rows.append(
+                {
+                    **values,
+                    "observation_code": "outliers_only_has_peak",
+                    "message": "Outliers-only VM has a best point before over-margin loses fixes.",
+                    "base_pr_pct": base_pr,
+                    "best_vm_mv": best_vm,
+                    "best_pr_pct": best_pr,
+                    "new_fail_count_at_best": int(best["new_fail_count"]),
+                }
+            )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_margin_audit_rows(margins: pd.DataFrame, limit: int = 500) -> pd.DataFrame:
+    if margins.empty:
+        return margins.copy()
+    audit = margins.copy()
+    base_pass = _base_pass_series(audit) if "base_pass" in audit.columns else pd.Series(False, index=audit.index)
+    audit["_base_fail_rank"] = (~base_pass).astype(int)
+    audit["_required_margin_sort"] = pd.to_numeric(
+        audit.get("required_margin_mv", 0), errors="coerce").fillna(-1)
+    audit = audit.sort_values(
+        ["_base_fail_rank", "_required_margin_sort"],
+        ascending=[False, False],
+        kind="mergesort",
+    ).head(limit)
+    return audit.drop(columns=["_base_fail_rank", "_required_margin_sort"], errors="ignore")
 
 
 def build_target_margin_plan(

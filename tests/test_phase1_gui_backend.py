@@ -5,8 +5,10 @@ import pandas as pd
 from voltage_margin.gui.phase1_backend import (
     Phase1RunConfig,
     build_target_margin_plan,
+    build_margin_audit_rows,
     build_vm_sweep,
     build_vm_target_summary,
+    find_vm_observations,
     enrich_margin_rows,
     filter_margins,
     format_margin_trace_detail,
@@ -240,6 +242,51 @@ def test_build_vm_sweep_models_all_rows_and_outliers_only_scopes():
     assert all_2mv["new_fail_count"] == 1
 
 
+def test_outliers_only_uses_all_rows_denominator_but_only_updates_base_fails():
+    margins = pd.DataFrame(
+        [
+            {
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Skew",
+                "arc": "base_pass_that_would_fail",
+                "mc_value_ps": 100.0,
+                "dif_ps": 0.5,
+                "sensitivity_ps_per_mv": 1.0,
+                "abs_threshold_ps": 1.0,
+                "rel_threshold": 0.01,
+                "base_pass": True,
+            },
+            {
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Skew",
+                "arc": "base_fail_fixed",
+                "mc_value_ps": 100.0,
+                "dif_ps": -2.0,
+                "sensitivity_ps_per_mv": 1.0,
+                "abs_threshold_ps": 1.0,
+                "rel_threshold": 0.01,
+                "base_pass": False,
+            },
+        ]
+    )
+
+    sweep = build_vm_sweep(margins, max_margin_mv=2, step_mv=1)
+    outlier_2mv = sweep[
+        (sweep["scope"] == "outliers_only") & (sweep["margin_mv"] == 2)
+    ].iloc[0]
+    all_2mv = sweep[(sweep["scope"] == "all_rows") & (sweep["margin_mv"] == 2)].iloc[0]
+
+    assert outlier_2mv["total_count"] == 2
+    assert outlier_2mv["pass_count"] == 2
+    assert outlier_2mv["new_fail_count"] == 0
+    assert all_2mv["pass_count"] == 1
+    assert all_2mv["new_fail_count"] == 1
+
+
 def test_build_vm_target_summary_finds_first_margin_reaching_target():
     sweep = pd.DataFrame(
         [
@@ -292,6 +339,139 @@ def test_build_vm_target_summary_finds_first_margin_reaching_target():
     assert row["target_pass_rate_pct"] == 95.0
     assert row["pass_rate_at_required_vm_pct"] == 95.4
     assert row["base_pr_pct"] == 82.2
+
+
+def test_build_vm_target_summary_reports_best_when_target_not_reached():
+    sweep = pd.DataFrame(
+        [
+            {
+                "scope": "all_rows",
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Late_Sigma",
+                "margin_mv": 0,
+                "pass_rate_pct": 74.0,
+                "pass_count": 74,
+                "total_count": 100,
+                "fixed_count": 0,
+                "new_fail_count": 0,
+            },
+            {
+                "scope": "all_rows",
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Late_Sigma",
+                "margin_mv": 1,
+                "pass_rate_pct": 52.0,
+                "pass_count": 52,
+                "total_count": 100,
+                "fixed_count": 1,
+                "new_fail_count": 23,
+            },
+        ]
+    )
+
+    summary = build_vm_target_summary(sweep, target_pass_rate_pct=95.0)
+
+    row = summary.iloc[0]
+    assert pd.isna(row["required_vm_mv"])
+    assert row["status"] == "not_reached"
+    assert row["best_vm_mv"] == 0
+    assert row["best_pr_pct"] == 74.0
+    assert row["trend"] == "declines"
+
+
+def test_find_vm_observations_flags_all_rows_decline_and_outlier_best_point():
+    sweep = pd.DataFrame(
+        [
+            {
+                "scope": "all_rows",
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Late_Sigma",
+                "margin_mv": 0,
+                "pass_rate_pct": 80.0,
+                "pass_count": 80,
+                "total_count": 100,
+                "fixed_count": 0,
+                "new_fail_count": 0,
+            },
+            {
+                "scope": "all_rows",
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Late_Sigma",
+                "margin_mv": 1,
+                "pass_rate_pct": 70.0,
+                "pass_count": 70,
+                "total_count": 100,
+                "fixed_count": 2,
+                "new_fail_count": 12,
+            },
+            {
+                "scope": "outliers_only",
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Late_Sigma",
+                "margin_mv": 0,
+                "pass_rate_pct": 80.0,
+                "pass_count": 80,
+                "total_count": 100,
+                "fixed_count": 0,
+                "new_fail_count": 0,
+            },
+            {
+                "scope": "outliers_only",
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Late_Sigma",
+                "margin_mv": 1,
+                "pass_rate_pct": 90.0,
+                "pass_count": 90,
+                "total_count": 100,
+                "fixed_count": 10,
+                "new_fail_count": 0,
+            },
+            {
+                "scope": "outliers_only",
+                "compare_source": "fmc_compare",
+                "corner": "c1",
+                "analysis_type": "delay",
+                "metric": "Late_Sigma",
+                "margin_mv": 2,
+                "pass_rate_pct": 85.0,
+                "pass_count": 85,
+                "total_count": 100,
+                "fixed_count": 5,
+                "new_fail_count": 0,
+            },
+        ]
+    )
+
+    observations = find_vm_observations(sweep)
+
+    assert "all_rows_degrades" in observations["observation_code"].tolist()
+    assert "outliers_only_has_peak" in observations["observation_code"].tolist()
+
+
+def test_build_margin_audit_rows_limits_to_most_relevant_rows():
+    margins = pd.DataFrame(
+        [
+            {"arc": "small", "required_margin_mv": 1.0, "base_pass": True},
+            {"arc": "large", "required_margin_mv": 9.0, "base_pass": False},
+            {"arc": "mid", "required_margin_mv": 5.0, "base_pass": False},
+        ]
+    )
+
+    audit = build_margin_audit_rows(margins, limit=2)
+
+    assert audit["arc"].tolist() == ["large", "mid"]
 
 
 def test_enrich_margin_rows_adds_sensitivity_sources_for_audit():
