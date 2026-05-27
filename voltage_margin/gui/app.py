@@ -164,12 +164,12 @@ class VoltageMarginApp:
             "slew": tk.BooleanVar(value=True),
             "hold": tk.BooleanVar(value=True),
         }
-        self.filter_vars = {
-            "source": tk.StringVar(value="All"),
-            "type": tk.StringVar(value="All"),
-            "metric": tk.StringVar(value="All"),
-            "corner": tk.StringVar(value="All"),
-            "status": tk.StringVar(value="All"),
+        self.filter_value_vars = {
+            "source": {},
+            "type": {},
+            "metric": {},
+            "corner": {},
+            "status": {},
         }
         self.plot_type_var = tk.StringVar(value="Selected PR Curve")
         self.status_var = tk.StringVar(value="Ready. Select input and output folders.")
@@ -343,15 +343,20 @@ class VoltageMarginApp:
             ("Corner", "corner"),
             ("Status", "status"),
         ]
-        self.filter_boxes = {}
+        self.filter_frames = {}
         for label, key in filter_specs:
-            ttk.Label(parent, text=label).pack(anchor="w", pady=(0, 2))
-            box = ttk.Combobox(parent, textvariable=self.filter_vars[key],
-                               values=["All"], state="readonly", width=24)
-            box.pack(fill="x", pady=(0, 10))
-            box.bind("<<ComboboxSelected>>", lambda _event: self._apply_margin_filters())
-            self.filter_boxes[key] = box
-        ttk.Button(parent, text="Reset Filters", command=self._reset_filters).pack(fill="x")
+            group = ttk.LabelFrame(parent, text=label, style="Card.TLabelframe", padding=(6, 4))
+            group.pack(fill="x", pady=(0, 8))
+            options = ttk.Frame(group)
+            options.pack(fill="x")
+            actions = ttk.Frame(group)
+            actions.pack(fill="x", pady=(4, 0))
+            ttk.Button(actions, text="All", command=lambda k=key: self._set_filter_group(k, True)).pack(
+                side="left", fill="x", expand=True)
+            ttk.Button(actions, text="Clear", command=lambda k=key: self._set_filter_group(k, False)).pack(
+                side="left", fill="x", expand=True, padx=(4, 0))
+            self.filter_frames[key] = options
+        ttk.Button(parent, text="Reset All Filters", command=self._reset_filters).pack(fill="x")
 
     def _build_notebook(self, parent):
         self.notebook = ttk.Notebook(parent)
@@ -554,14 +559,53 @@ class VoltageMarginApp:
             "status": "margin_status",
         }
         for key, column in mapping.items():
-            values = ["All"] + unique_values(margins, column)
-            self.filter_boxes[key]["values"] = values
-            if self.filter_vars[key].get() not in values:
-                self.filter_vars[key].set("All")
+            self._rebuild_filter_group(key, unique_values(margins, column))
+
+    def _rebuild_filter_group(self, key, values):
+        frame = self.filter_frames[key]
+        old_vars = self.filter_value_vars.get(key, {})
+        old_selected = {
+            value for value, var in old_vars.items()
+            if var.get()
+        }
+        had_old_values = bool(old_vars)
+        for child in frame.winfo_children():
+            child.destroy()
+        new_vars = {}
+        for value in values:
+            selected = value in old_selected if had_old_values else True
+            var = tk.BooleanVar(value=selected)
+            check = ttk.Checkbutton(
+                frame,
+                text=value,
+                variable=var,
+                command=self._apply_margin_filters,
+            )
+            check.pack(anchor="w")
+            new_vars[value] = var
+        if not values:
+            ttk.Label(frame, text="No values loaded", style="Muted.TLabel").pack(anchor="w")
+        self.filter_value_vars[key] = new_vars
+
+    def _set_filter_group(self, key, selected):
+        for var in self.filter_value_vars.get(key, {}).values():
+            var.set(selected)
+        self._apply_margin_filters()
+
+    def _filter_include_values(self):
+        include = {}
+        for key, value_vars in self.filter_value_vars.items():
+            if value_vars:
+                include[key] = {
+                    value for value, var in value_vars.items()
+                    if var.get()
+                }
+        return include
 
     def _reset_filters(self):
-        for var in self.filter_vars.values():
-            var.set("All")
+        for key in self.filter_value_vars:
+            for var in self.filter_value_vars[key].values():
+                var.set(True)
         self._apply_margin_filters()
 
     def _apply_margin_filters(self):
@@ -569,11 +613,7 @@ class VoltageMarginApp:
             return
         filtered = filter_margins(
             self.margin_rows,
-            source=self.filter_vars["source"].get(),
-            analysis_type=self.filter_vars["type"].get(),
-            metric=self.filter_vars["metric"].get(),
-            corner=self.filter_vars["corner"].get(),
-            status=self.filter_vars["status"].get(),
+            include_values=self._filter_include_values(),
         )
         self._populate_table("Margins", build_margin_audit_rows(filtered), MARGIN_COLUMNS)
         filtered_sweep = self._filtered_sweep_from_filters()
@@ -588,28 +628,63 @@ class VoltageMarginApp:
             self._filter_group_table(self.observations),
             OBSERVATION_COLUMNS,
         )
+        self._populate_table(
+            "Pass Rate",
+            self._filter_table_by_inclusions(
+                self.tables.pass_rate,
+                {"corner": "Corner", "type": "Type", "metric": "Parameter"},
+            ),
+            PASS_RATE_COLUMNS,
+        )
+        self._populate_table(
+            "Sensitivity",
+            self._filter_table_by_inclusions(
+                self.tables.sensitivity,
+                {
+                    "source": "compare_source",
+                    "corner": "corner",
+                    "type": "analysis_type",
+                    "metric": "metric",
+                },
+            ),
+            SENSITIVITY_COLUMNS,
+        )
+        self._populate_table(
+            "Warnings",
+            self._filter_table_by_inclusions(
+                self._combined_warnings(),
+                {"corner": "corner", "type": "analysis_type", "metric": "metric"},
+            ),
+            WARNING_COLUMNS,
+        )
         if self.current_tab_name == "Margins":
             self._select_first_margin()
-        if self.current_tab_name in {"95% Target", "Observations", "VM Sweep", "Plots"}:
+        if self.current_tab_name == "Plots":
             self._update_plot()
 
     def _filtered_sweep_from_filters(self):
         return self._filter_group_table(self.vm_sweep)
 
     def _filter_group_table(self, df):
+        return self._filter_table_by_inclusions(
+            df,
+            {
+                "source": "compare_source",
+                "type": "analysis_type",
+                "metric": "metric",
+                "corner": "corner",
+            },
+        )
+
+    def _filter_table_by_inclusions(self, df, column_map):
         if df.empty:
             return df
         filtered = df.copy()
-        mapping = {
-            "source": "compare_source",
-            "type": "analysis_type",
-            "metric": "metric",
-            "corner": "corner",
-        }
-        for key, column in mapping.items():
-            value = self.filter_vars[key].get()
-            if value and value != "All" and column in filtered.columns:
-                filtered = filtered[filtered[column].astype(str) == str(value)]
+        include = self._filter_include_values()
+        for key, values in include.items():
+            column = column_map.get(key)
+            if column and column in filtered.columns:
+                filtered = filtered[filtered[column].astype(str).isin(values)]
         return filtered
 
     def _populate_table(self, name, df, preferred_columns):
@@ -659,6 +734,8 @@ class VoltageMarginApp:
     def _on_tab_changed(self, _event):
         selected = self.notebook.select()
         self.current_tab_name = self.notebook.tab(selected, "text")
+        if self.current_tab_name == "Plots":
+            self._update_plot()
 
     def _on_table_select(self, tab_name):
         tree = self.display_trees[tab_name]

@@ -159,6 +159,7 @@ def filter_margins(
     metric: str = "All",
     corner: str = "All",
     status: str = "All",
+    include_values: dict[str, set[str]] | None = None,
 ) -> pd.DataFrame:
     filtered = margins.copy()
     filters = {
@@ -171,6 +172,18 @@ def filter_margins(
     for column, value in filters.items():
         if value and value != "All" and column in filtered.columns:
             filtered = filtered[filtered[column].astype(str) == str(value)]
+    if include_values:
+        include_columns = {
+            "source": "compare_source",
+            "type": "analysis_type",
+            "metric": "metric",
+            "corner": "corner",
+            "status": "margin_status",
+        }
+        for key, values in include_values.items():
+            column = include_columns.get(key, key)
+            if column in filtered.columns and values is not None:
+                filtered = filtered[filtered[column].astype(str).isin(set(values))]
     return filtered
 
 

@@ -125,6 +125,46 @@ def test_filter_margins_filters_by_user_visible_fields():
     assert filtered.iloc[0]["compare_source"] == "fmc_compare"
 
 
+def test_filter_margins_can_exclude_multiple_values_with_on_off_filters():
+    margins = pd.DataFrame(
+        [
+            {
+                "compare_source": "fmc_compare",
+                "analysis_type": "delay",
+                "metric": "Nominal",
+                "corner": "ssgnp_0p450v_m40c",
+                "margin_status": "ok",
+            },
+            {
+                "compare_source": "fmc_compare",
+                "analysis_type": "delay",
+                "metric": "Skew",
+                "corner": "ssgnp_0p450v_m40c",
+                "margin_status": "ok",
+            },
+            {
+                "compare_source": "fmc_compare",
+                "analysis_type": "delay",
+                "metric": "Skew",
+                "corner": "ssgnp_0p465v_m40c",
+                "margin_status": "ok",
+            },
+        ]
+    )
+
+    filtered = filter_margins(
+        margins,
+        include_values={
+            "metric": {"Skew"},
+            "corner": {"ssgnp_0p465v_m40c"},
+        },
+    )
+
+    assert len(filtered) == 1
+    assert filtered.iloc[0]["metric"] == "Skew"
+    assert filtered.iloc[0]["corner"] == "ssgnp_0p465v_m40c"
+
+
 def test_build_target_margin_plan_answers_95_percent_by_corner_and_type():
     margins = pd.DataFrame(
         [
