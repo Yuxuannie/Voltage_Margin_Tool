@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shlex
 import webbrowser
 from pathlib import Path
 import tkinter as tk
@@ -12,13 +13,18 @@ import pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 from ..core.config_loader import DEFAULT_COLUMN_MAPPING, DEFAULT_POLICY
-from ..visualization.plots import plot_pass_rate_bars
 from .phase1_backend import (
     OutputTables,
     Phase1RunConfig,
+    build_margin_audit_rows,
+    build_vm_sweep,
+    build_vm_target_summary,
+    enrich_margin_rows,
+    find_vm_observations,
     filter_margins,
     format_margin_trace_detail,
     load_output_package,
+    read_source_context,
     read_source_line,
     run_phase1_pipeline,
     summarize_margins,
@@ -28,6 +34,52 @@ from .phase1_backend import (
 
 logger = logging.getLogger(__name__)
 
+
+TARGET_COLUMNS = [
+    "scope",
+    "compare_source",
+    "corner",
+    "analysis_type",
+    "metric",
+    "base_pr_pct",
+    "required_vm_mv",
+    "pass_rate_at_required_vm_pct",
+    "fixed_count_at_required_vm",
+    "new_fail_count_at_required_vm",
+    "best_vm_mv",
+    "best_pr_pct",
+    "trend",
+    "total_count",
+    "status",
+]
+
+VM_SWEEP_COLUMNS = [
+    "scope",
+    "compare_source",
+    "corner",
+    "analysis_type",
+    "metric",
+    "margin_mv",
+    "pass_rate_pct",
+    "pass_count",
+    "total_count",
+    "fixed_count",
+    "new_fail_count",
+]
+
+OBSERVATION_COLUMNS = [
+    "observation_code",
+    "scope",
+    "compare_source",
+    "corner",
+    "analysis_type",
+    "metric",
+    "message",
+    "base_pr_pct",
+    "best_vm_mv",
+    "best_pr_pct",
+    "new_fail_count_at_best",
+]
 
 PASS_RATE_COLUMNS = [
     "Corner",
@@ -112,18 +164,19 @@ class VoltageMarginApp:
             "slew": tk.BooleanVar(value=True),
             "hold": tk.BooleanVar(value=True),
         }
-        self.filter_vars = {
-            "source": tk.StringVar(value="All"),
-            "type": tk.StringVar(value="All"),
-            "metric": tk.StringVar(value="All"),
-            "corner": tk.StringVar(value="All"),
-            "status": tk.StringVar(value="All"),
+        self.filter_value_vars = {
+            "source": {},
+            "type": {},
+            "metric": {},
+            "corner": {},
+            "status": {},
         }
+        self.plot_type_var = tk.StringVar(value="Selected PR Curve")
         self.status_var = tk.StringVar(value="Ready. Select input and output folders.")
         self.summary_var = tk.StringVar(value="No run loaded.")
         self.trace_title_var = tk.StringVar(value="Select a margin row to inspect trace.")
         self.path_line_var = tk.StringVar(value="")
-        self.current_tab_name = "Margins"
+        self.current_tab_name = "95% Target"
         self.kpi_vars = {
             "margins": tk.StringVar(value="0"),
             "ok": tk.StringVar(value="0"),
@@ -132,6 +185,10 @@ class VoltageMarginApp:
         }
         self.selected_margin_detail = {}
         self.tables: OutputTables | None = None
+        self.margin_rows = pd.DataFrame()
+        self.vm_sweep = pd.DataFrame()
+        self.target_plan = pd.DataFrame()
+        self.observations = pd.DataFrame()
         self.display_frames = {}
         self.display_trees = {}
         self.display_dfs = {}
@@ -216,9 +273,9 @@ class VoltageMarginApp:
         kpi_bar = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         kpi_bar.pack(fill="x")
         specs = [
-            ("Voltage Margin Rows", "margins"),
-            ("OK Margins", "ok"),
-            ("Need Review", "review"),
+            ("Margin Rows", "margins"),
+            ("OK", "ok"),
+            ("Review", "review"),
             ("Trace Links", "trace"),
         ]
         for idx, (label, key) in enumerate(specs):
@@ -254,6 +311,21 @@ class VoltageMarginApp:
             side="left", padx=(8, 0))
         ttk.Button(type_frame, text="Save Plot", command=self._save_plot).pack(
             side="left", padx=(8, 0))
+        ttk.Label(type_frame, text="Plot:").pack(side="left", padx=(18, 4))
+        plot_box = ttk.Combobox(
+            type_frame,
+            textvariable=self.plot_type_var,
+            values=[
+                "Selected PR Curve",
+                "Target VM Ranking",
+                "Scope Difference",
+                "Observation Summary",
+            ],
+            state="readonly",
+            width=22,
+        )
+        plot_box.pack(side="left")
+        plot_box.bind("<<ComboboxSelected>>", lambda _event: self._update_plot())
         ttk.Label(type_frame, textvariable=self.summary_var, style="Muted.TLabel").pack(
             side="left", padx=(18, 0))
 
@@ -271,20 +343,34 @@ class VoltageMarginApp:
             ("Corner", "corner"),
             ("Status", "status"),
         ]
-        self.filter_boxes = {}
+        self.filter_frames = {}
         for label, key in filter_specs:
-            ttk.Label(parent, text=label).pack(anchor="w", pady=(0, 2))
-            box = ttk.Combobox(parent, textvariable=self.filter_vars[key],
-                               values=["All"], state="readonly", width=24)
-            box.pack(fill="x", pady=(0, 10))
-            box.bind("<<ComboboxSelected>>", lambda _event: self._apply_margin_filters())
-            self.filter_boxes[key] = box
-        ttk.Button(parent, text="Reset Filters", command=self._reset_filters).pack(fill="x")
+            group = ttk.LabelFrame(parent, text=label, style="Card.TLabelframe", padding=(6, 4))
+            group.pack(fill="x", pady=(0, 8))
+            options = ttk.Frame(group)
+            options.pack(fill="x")
+            actions = ttk.Frame(group)
+            actions.pack(fill="x", pady=(4, 0))
+            ttk.Button(actions, text="All", command=lambda k=key: self._set_filter_group(k, True)).pack(
+                side="left", fill="x", expand=True)
+            ttk.Button(actions, text="Clear", command=lambda k=key: self._set_filter_group(k, False)).pack(
+                side="left", fill="x", expand=True, padx=(4, 0))
+            self.filter_frames[key] = options
+        ttk.Button(parent, text="Reset All Filters", command=self._reset_filters).pack(fill="x")
 
     def _build_notebook(self, parent):
         self.notebook = ttk.Notebook(parent)
         self.notebook.pack(fill="both", expand=True)
-        for name in ["Pass Rate", "Margins", "Sensitivity", "Warnings", "Trace"]:
+        for name in [
+            "95% Target",
+            "Observations",
+            "VM Sweep",
+            "Margins",
+            "Pass Rate",
+            "Sensitivity",
+            "Warnings",
+            "Trace",
+        ]:
             frame = ttk.Frame(self.notebook, style="Panel.TFrame")
             self.notebook.add(frame, text=name)
             self._build_table_tab(name, frame)
@@ -292,7 +378,7 @@ class VoltageMarginApp:
         plot_frame = ttk.Frame(self.notebook, style="Panel.TFrame")
         self.notebook.add(plot_frame, text="Plots")
         self._build_plot_tab(plot_frame)
-        self.notebook.select(1)
+        self.notebook.select(0)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _build_table_tab(self, name, frame):
@@ -332,9 +418,12 @@ class VoltageMarginApp:
                   font=("Helvetica", 11, "bold")).pack(side="left", anchor="w")
         ttk.Button(top, text="Copy path:line", command=self._copy_path_line).pack(
             side="right", padx=(6, 0))
+        ttk.Button(top, text="Copy less command", command=self._copy_less_command).pack(
+            side="right", padx=(6, 0))
         ttk.Button(top, text="Open Source", command=self._open_source_file).pack(
             side="right", padx=(6, 0))
-        ttk.Button(top, text="Show Raw Row", command=self._show_raw_row).pack(side="right")
+        ttk.Button(top, text="Show Source Context", command=self._show_raw_row).pack(
+            side="right")
 
         self.path_line_value = ttk.Label(
             parent,
@@ -405,6 +494,11 @@ class VoltageMarginApp:
                 )
             )
             self.tables = load_output_package(result.output_dir)
+            self.margin_rows = enrich_margin_rows(
+                self.tables.all_margins, self.tables.sensitivity, self.tables.per_arc)
+            self.vm_sweep = build_vm_sweep(self.margin_rows, max_margin_mv=50, step_mv=1)
+            self.target_plan = build_vm_target_summary(self.vm_sweep)
+            self.observations = find_vm_observations(self.vm_sweep)
             self.summary_var.set(
                 f"{result.parameter_groups} groups, {result.total_arcs} arcs")
             self._refresh_all_tables()
@@ -421,6 +515,9 @@ class VoltageMarginApp:
     def _refresh_all_tables(self):
         if self.tables is None:
             return
+        self._populate_table("95% Target", self.target_plan, TARGET_COLUMNS)
+        self._populate_table("Observations", self.observations, OBSERVATION_COLUMNS)
+        self._populate_table("VM Sweep", self.vm_sweep, VM_SWEEP_COLUMNS)
         self._populate_table("Pass Rate", self.tables.pass_rate, PASS_RATE_COLUMNS)
         self._apply_margin_filters()
         self._populate_table("Sensitivity", self.tables.sensitivity, SENSITIVITY_COLUMNS)
@@ -430,7 +527,7 @@ class VoltageMarginApp:
     def _refresh_kpis(self):
         if self.tables is None:
             return
-        summary = summarize_margins(self.tables.all_margins, self.tables.margin_trace)
+        summary = summarize_margins(self.margin_rows, self.tables.margin_trace)
         self.kpi_vars["margins"].set(str(summary.total_margins))
         self.kpi_vars["ok"].set(str(summary.ok_margins))
         self.kpi_vars["review"].set(str(summary.needs_review))
@@ -453,7 +550,7 @@ class VoltageMarginApp:
     def _refresh_filter_options(self):
         if self.tables is None:
             return
-        margins = self.tables.all_margins
+        margins = self.margin_rows
         mapping = {
             "source": "compare_source",
             "type": "analysis_type",
@@ -462,30 +559,133 @@ class VoltageMarginApp:
             "status": "margin_status",
         }
         for key, column in mapping.items():
-            values = ["All"] + unique_values(margins, column)
-            self.filter_boxes[key]["values"] = values
-            if self.filter_vars[key].get() not in values:
-                self.filter_vars[key].set("All")
+            self._rebuild_filter_group(key, unique_values(margins, column))
+
+    def _rebuild_filter_group(self, key, values):
+        frame = self.filter_frames[key]
+        old_vars = self.filter_value_vars.get(key, {})
+        old_selected = {
+            value for value, var in old_vars.items()
+            if var.get()
+        }
+        had_old_values = bool(old_vars)
+        for child in frame.winfo_children():
+            child.destroy()
+        new_vars = {}
+        for value in values:
+            selected = value in old_selected if had_old_values else True
+            var = tk.BooleanVar(value=selected)
+            check = ttk.Checkbutton(
+                frame,
+                text=value,
+                variable=var,
+                command=self._apply_margin_filters,
+            )
+            check.pack(anchor="w")
+            new_vars[value] = var
+        if not values:
+            ttk.Label(frame, text="No values loaded", style="Muted.TLabel").pack(anchor="w")
+        self.filter_value_vars[key] = new_vars
+
+    def _set_filter_group(self, key, selected):
+        for var in self.filter_value_vars.get(key, {}).values():
+            var.set(selected)
+        self._apply_margin_filters()
+
+    def _filter_include_values(self):
+        include = {}
+        for key, value_vars in self.filter_value_vars.items():
+            if value_vars:
+                include[key] = {
+                    value for value, var in value_vars.items()
+                    if var.get()
+                }
+        return include
 
     def _reset_filters(self):
-        for var in self.filter_vars.values():
-            var.set("All")
+        for key in self.filter_value_vars:
+            for var in self.filter_value_vars[key].values():
+                var.set(True)
         self._apply_margin_filters()
 
     def _apply_margin_filters(self):
         if self.tables is None:
             return
         filtered = filter_margins(
-            self.tables.all_margins,
-            source=self.filter_vars["source"].get(),
-            analysis_type=self.filter_vars["type"].get(),
-            metric=self.filter_vars["metric"].get(),
-            corner=self.filter_vars["corner"].get(),
-            status=self.filter_vars["status"].get(),
+            self.margin_rows,
+            include_values=self._filter_include_values(),
         )
-        self._populate_table("Margins", filtered, MARGIN_COLUMNS)
+        self._populate_table("Margins", build_margin_audit_rows(filtered), MARGIN_COLUMNS)
+        filtered_sweep = self._filtered_sweep_from_filters()
+        self._populate_table(
+            "95% Target",
+            build_vm_target_summary(filtered_sweep),
+            TARGET_COLUMNS,
+        )
+        self._populate_table("VM Sweep", filtered_sweep, VM_SWEEP_COLUMNS)
+        self._populate_table(
+            "Observations",
+            self._filter_group_table(self.observations),
+            OBSERVATION_COLUMNS,
+        )
+        self._populate_table(
+            "Pass Rate",
+            self._filter_table_by_inclusions(
+                self.tables.pass_rate,
+                {"corner": "Corner", "type": "Type", "metric": "Parameter"},
+            ),
+            PASS_RATE_COLUMNS,
+        )
+        self._populate_table(
+            "Sensitivity",
+            self._filter_table_by_inclusions(
+                self.tables.sensitivity,
+                {
+                    "source": "compare_source",
+                    "corner": "corner",
+                    "type": "analysis_type",
+                    "metric": "metric",
+                },
+            ),
+            SENSITIVITY_COLUMNS,
+        )
+        self._populate_table(
+            "Warnings",
+            self._filter_table_by_inclusions(
+                self._combined_warnings(),
+                {"corner": "corner", "type": "analysis_type", "metric": "metric"},
+            ),
+            WARNING_COLUMNS,
+        )
         if self.current_tab_name == "Margins":
             self._select_first_margin()
+        if self.current_tab_name == "Plots":
+            self._update_plot()
+
+    def _filtered_sweep_from_filters(self):
+        return self._filter_group_table(self.vm_sweep)
+
+    def _filter_group_table(self, df):
+        return self._filter_table_by_inclusions(
+            df,
+            {
+                "source": "compare_source",
+                "type": "analysis_type",
+                "metric": "metric",
+                "corner": "corner",
+            },
+        )
+
+    def _filter_table_by_inclusions(self, df, column_map):
+        if df.empty:
+            return df
+        filtered = df.copy()
+        include = self._filter_include_values()
+        for key, values in include.items():
+            column = column_map.get(key)
+            if column and column in filtered.columns:
+                filtered = filtered[filtered[column].astype(str).isin(values)]
+        return filtered
 
     def _populate_table(self, name, df, preferred_columns):
         tree = self.display_trees[name]
@@ -494,7 +694,7 @@ class VoltageMarginApp:
         tree["columns"] = columns
         for column in columns:
             tree.heading(column, text=column, command=lambda c=column, n=name: self._sort_table(n, c))
-            width = 230 if column in {"arc", "source_file", "source_file_relative"} else 120
+            width = 280 if column in {"arc", "worst_arc"} else 180 if "source" in column else 120
             tree.column(column, width=width, minwidth=70, anchor="w")
         if df.empty:
             self.display_dfs[name] = df
@@ -507,9 +707,9 @@ class VoltageMarginApp:
             tree.insert("", "end", iid=str(idx), values=values, tags=tags)
 
     def _row_tags(self, name, row):
-        if name != "Margins":
+        if name not in {"Margins", "95% Target"}:
             return ()
-        status = str(row.get("margin_status", "") or "")
+        status = str(row.get("margin_status", "") or row.get("status", "") or "ok")
         if status == "ok":
             return ("ok",)
         if status:
@@ -534,21 +734,44 @@ class VoltageMarginApp:
     def _on_tab_changed(self, _event):
         selected = self.notebook.select()
         self.current_tab_name = self.notebook.tab(selected, "text")
+        if self.current_tab_name == "Plots":
+            self._update_plot()
 
     def _on_table_select(self, tab_name):
-        if tab_name != "Margins":
-            return
         tree = self.display_trees[tab_name]
         selected = tree.selection()
         if not selected:
             return
         row = self.display_dfs[tab_name].iloc[int(selected[0])]
-        self._show_margin_detail(row)
+        if tab_name == "Margins":
+            self._show_margin_detail(row)
+        elif tab_name == "95% Target":
+            self._show_target_detail(row)
+        elif tab_name == "Observations":
+            self._show_observation_detail(row)
 
     def _show_margin_workspace(self):
-        self.notebook.select(1)
-        self.current_tab_name = "Margins"
-        self._select_first_margin()
+        self.notebook.select(0)
+        self.current_tab_name = "95% Target"
+        self._select_first_target()
+
+    def _select_first_target(self):
+        tree = self.display_trees.get("95% Target")
+        if tree is None:
+            return
+        children = tree.get_children()
+        if not children:
+            self.trace_title_var.set("No 95% target margin rows available.")
+            self.path_line_var.set("")
+            self.selected_margin_detail = {}
+            self._write_trace_text("No target margin rows match the current filters.")
+            return
+        first = children[0]
+        tree.selection_set(first)
+        tree.focus(first)
+        tree.see(first)
+        row = self.display_dfs["95% Target"].iloc[int(first)]
+        self._show_target_detail(row)
 
     def _select_first_margin(self):
         tree = self.display_trees.get("Margins")
@@ -573,6 +796,13 @@ class VoltageMarginApp:
         self.selected_margin_detail = detail
         self.trace_title_var.set(detail["title"] or "Selected margin")
         self.path_line_var.set(detail["path_line"])
+        context = ""
+        if detail["source_file"] and detail["source_line_number"]:
+            try:
+                context = read_source_context(
+                    detail["source_file"], detail["source_line_number"], radius=2)
+            except Exception:
+                context = ""
         text = "\n".join(
             [
                 f"Arc: {detail['arc']}",
@@ -581,12 +811,58 @@ class VoltageMarginApp:
                 f"Sensitivity trace: {detail['sensitivity_trace_id']}",
                 f"Low sources: {detail['low_sources']}",
                 f"High sources: {detail['high_sources']}",
+                "",
+                "Source context:",
+                context,
             ]
         )
-        self.trace_text.configure(state="normal")
-        self.trace_text.delete("1.0", "end")
-        self.trace_text.insert("1.0", text)
-        self.trace_text.configure(state="disabled")
+        self._write_trace_text(text)
+
+    def _show_target_detail(self, row):
+        self.trace_title_var.set(
+            f"VM target: {row.get('corner')} / {row.get('analysis_type')} / {row.get('metric')}")
+        self.path_line_var.set("")
+        self.selected_margin_detail = {}
+        required_vm = row.get("required_vm_mv")
+        required_text = "not reached" if pd.isna(required_vm) else f"{required_vm:.0f} mV"
+        self._write_trace_text(
+            "\n".join(
+                [
+                    f"Scope: {row.get('scope')}",
+                    f"Base PR: {row.get('base_pr_pct'):.3g}%",
+                    f"Required VM to reach 95% PR: {required_text}",
+                    f"PR at required VM: {row.get('pass_rate_at_required_vm_pct'):.3g}%",
+                    f"Best VM in sweep: {row.get('best_vm_mv'):.0f} mV",
+                    f"Best PR in sweep: {row.get('best_pr_pct'):.3g}%",
+                    f"Trend: {row.get('trend')}",
+                    f"Fixed outliers at required VM: {row.get('fixed_count_at_required_vm')}",
+                    f"New fails at required VM: {row.get('new_fail_count_at_required_vm')}",
+                    "",
+                    "Scope meaning:",
+                    "all_rows applies VM to every row, so pessimistic rows can become new fails.",
+                    "outliers_only applies VM only to base failing rows and holds base passing rows fixed.",
+                ]
+            )
+        )
+
+    def _show_observation_detail(self, row):
+        self.trace_title_var.set(
+            f"Observation: {row.get('corner')} / {row.get('analysis_type')} / {row.get('metric')}"
+        )
+        self.path_line_var.set("")
+        self.selected_margin_detail = {}
+        self._write_trace_text(
+            "\n".join(
+                [
+                    f"{row.get('observation_code')}: {row.get('message')}",
+                    f"Scope: {row.get('scope')}",
+                    f"Base PR: {row.get('base_pr_pct'):.3g}%",
+                    f"Best VM: {row.get('best_vm_mv'):.0f} mV",
+                    f"Best PR: {row.get('best_pr_pct'):.3g}%",
+                    f"New fails at best VM: {row.get('new_fail_count_at_best')}",
+                ]
+            )
+        )
 
     def _write_trace_text(self, text):
         self.trace_text.configure(state="normal")
@@ -601,6 +877,15 @@ class VoltageMarginApp:
             self.root.clipboard_append(path_line)
             self.status_var.set(f"Copied {path_line}")
 
+    def _copy_less_command(self):
+        source_file = self.selected_margin_detail.get("source_file", "")
+        line_number = self.selected_margin_detail.get("source_line_number", "")
+        if source_file and line_number:
+            command = f"less +{int(float(line_number))} {shlex.quote(source_file)}"
+            self.root.clipboard_clear()
+            self.root.clipboard_append(command)
+            self.status_var.set(f"Copied {command}")
+
     def _open_source_file(self):
         source_file = self.selected_margin_detail.get("source_file", "")
         if source_file and Path(source_file).exists():
@@ -614,11 +899,11 @@ class VoltageMarginApp:
         if not source_file or not line_number:
             return
         try:
-            raw = read_source_line(source_file, line_number)
+            raw = read_source_context(source_file, line_number, radius=3)
         except Exception as exc:
             messagebox.showerror("Could not read source row", str(exc))
             return
-        messagebox.showinfo("Raw Source Row", raw or "Line not found.")
+        messagebox.showinfo("Source Context", raw or "Line not found.")
 
     def _open_output_folder(self):
         output_dir = self.output_dir.get().strip()
@@ -640,10 +925,13 @@ class VoltageMarginApp:
             self.status_var.set(f"Exported {self.current_tab_name} to {path}")
 
     def _update_plot(self):
-        if self.tables is None or self.tables.pass_rate.empty:
+        if self.tables is None:
             return
         plt.close(self.current_fig)
-        self.current_fig = plot_pass_rate_bars(self.tables.pass_rate, title="Pass Rate Summary")
+        target_df = self.display_dfs.get("95% Target", self.target_plan)
+        sweep_df = self.display_dfs.get("VM Sweep", self.vm_sweep)
+        observations_df = self.display_dfs.get("Observations", self.observations)
+        self.current_fig = self._build_selected_plot(target_df, sweep_df, observations_df)
         self.canvas.get_tk_widget().destroy()
         self.toolbar.destroy()
         parent = self.notebook.nametowidget(self.notebook.tabs()[-1])
@@ -654,6 +942,171 @@ class VoltageMarginApp:
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
         self.toolbar.update()
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def _build_selected_plot(self, plan, sweep, observations):
+        plot_type = self.plot_type_var.get()
+        if plot_type == "Target VM Ranking":
+            return self._plot_vm_target(plan)
+        if plot_type == "Scope Difference":
+            return self._plot_scope_difference(plan)
+        if plot_type == "Observation Summary":
+            return self._plot_observation_summary(observations)
+        return self._plot_selected_pr_curve(plan, sweep)
+
+    def _plot_vm_target(self, plan):
+        fig, ax = plt.subplots(figsize=(12, 6))
+        fig.patch.set_facecolor("#f8fafb")
+        ax.set_facecolor("#ffffff")
+        if plan is None or plan.empty:
+            ax.text(0.5, 0.5, "Run analysis to see VM sweep pass-rate simulation",
+                    ha="center", va="center", fontsize=13, color="#66717d")
+            ax.axis("off")
+            return fig
+        plot_df = plan[plan["scope"].astype(str) == "all_rows"].copy()
+        if plot_df.empty:
+            plot_df = plan.copy()
+        plot_df = plot_df.sort_values(
+            ["required_vm_mv", "base_pr_pct"],
+            ascending=[False, True],
+            na_position="first",
+        ).head(24)
+        plot_df = plot_df.sort_values("required_vm_mv", ascending=True, na_position="first")
+        labels = plot_df.apply(
+            lambda r: f"{r['corner']} / {r['analysis_type']} / {r['metric']}",
+            axis=1,
+        )
+        values = pd.to_numeric(plot_df["required_vm_mv"], errors="coerce").fillna(50)
+        colors = ["#c2410c" if status == "not_reached" else "#0b63ce"
+                  for status in plot_df["status"]]
+        bars = ax.barh(labels, values, color=colors, alpha=0.88)
+        max_value = max(float(values.max()), 1.0)
+        for bar, value, status in zip(bars, values, plot_df["status"]):
+            label = ">50 mV" if status == "not_reached" else f"{value:.0f} mV"
+            ax.text(
+                bar.get_width() + max(max_value * 0.01, 0.2),
+                bar.get_y() + bar.get_height() / 2,
+                label,
+                va="center",
+                fontsize=8,
+                color="#17212b",
+            )
+        ax.set_xlabel("VM required for pass rate >=95% (mV)")
+        ax.set_title("All Rows VM Sweep: Minimum VM to Reach 95% Pass Rate")
+        ax.grid(axis="x", alpha=0.25)
+        ax.spines[["top", "right", "left"]].set_visible(False)
+        fig.tight_layout()
+        return fig
+
+    def _selected_target_key(self, plan):
+        tree = self.display_trees.get("95% Target")
+        if tree is not None and tree.selection():
+            row = self.display_dfs["95% Target"].iloc[int(tree.selection()[0])]
+        elif plan is not None and not plan.empty:
+            row = plan.iloc[0]
+        else:
+            return None
+        return {
+            "compare_source": row.get("compare_source"),
+            "corner": row.get("corner"),
+            "analysis_type": row.get("analysis_type"),
+            "metric": row.get("metric"),
+        }
+
+    def _plot_selected_pr_curve(self, plan, sweep):
+        fig, ax = plt.subplots(figsize=(12, 6))
+        fig.patch.set_facecolor("#f8fafb")
+        ax.set_facecolor("#ffffff")
+        key = self._selected_target_key(plan)
+        if key is None or sweep is None or sweep.empty:
+            ax.text(0.5, 0.5, "Select a 95% Target row to plot VM sweep",
+                    ha="center", va="center", fontsize=13, color="#66717d")
+            ax.axis("off")
+            return fig
+        df = sweep.copy()
+        for column, value in key.items():
+            df = df[df[column].astype(str) == str(value)]
+        if df.empty:
+            ax.text(0.5, 0.5, "No sweep rows for selected target",
+                    ha="center", va="center", fontsize=13, color="#66717d")
+            ax.axis("off")
+            return fig
+        colors = {"all_rows": "#c2410c", "outliers_only": "#0b63ce"}
+        for scope, group in df.groupby("scope"):
+            group = group.sort_values("margin_mv")
+            ax.plot(
+                group["margin_mv"],
+                group["pass_rate_pct"],
+                marker="o",
+                linewidth=2,
+                markersize=3,
+                label=scope,
+                color=colors.get(scope, None),
+            )
+        ax.axhline(95.0, color="#166534", linestyle="--", linewidth=1.2, label="95% target")
+        ax.set_ylim(0, 105)
+        ax.set_xlabel("Applied voltage margin (mV)")
+        ax.set_ylabel("Pass rate (%)")
+        ax.set_title(
+            f"PR vs VM: {key['corner']} / {key['analysis_type']} / {key['metric']}")
+        ax.grid(alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        return fig
+
+    def _plot_scope_difference(self, plan):
+        fig, ax = plt.subplots(figsize=(12, 6))
+        fig.patch.set_facecolor("#f8fafb")
+        ax.set_facecolor("#ffffff")
+        if plan is None or plan.empty:
+            ax.text(0.5, 0.5, "No target data", ha="center", va="center")
+            ax.axis("off")
+            return fig
+        pivot = plan.pivot_table(
+            index=["compare_source", "corner", "analysis_type", "metric"],
+            columns="scope",
+            values="best_pr_pct",
+            aggfunc="first",
+        ).reset_index()
+        if not {"all_rows", "outliers_only"}.issubset(pivot.columns):
+            ax.text(0.5, 0.5, "Need both scopes for difference plot", ha="center", va="center")
+            ax.axis("off")
+            return fig
+        pivot["delta_pct"] = pivot["outliers_only"] - pivot["all_rows"]
+        plot_df = pivot.sort_values("delta_pct", ascending=True).tail(24)
+        labels = plot_df.apply(
+            lambda r: f"{r['corner']} / {r['analysis_type']} / {r['metric']}",
+            axis=1,
+        )
+        bars = ax.barh(labels, plot_df["delta_pct"], color="#7c3aed", alpha=0.85)
+        for bar, value in zip(bars, plot_df["delta_pct"]):
+            ax.text(bar.get_width() + 0.2, bar.get_y() + bar.get_height() / 2,
+                    f"{value:.1f}pp", va="center", fontsize=8)
+        ax.set_xlabel("Best PR difference: outliers_only - all_rows (percentage points)")
+        ax.set_title("Where outliers-only is much more optimistic than all-rows")
+        ax.grid(axis="x", alpha=0.25)
+        ax.spines[["top", "right", "left"]].set_visible(False)
+        fig.tight_layout()
+        return fig
+
+    def _plot_observation_summary(self, observations):
+        fig, ax = plt.subplots(figsize=(10, 5))
+        fig.patch.set_facecolor("#f8fafb")
+        ax.set_facecolor("#ffffff")
+        if observations is None or observations.empty:
+            ax.text(0.5, 0.5, "No observations under current filters",
+                    ha="center", va="center", fontsize=13, color="#66717d")
+            ax.axis("off")
+            return fig
+        counts = observations["observation_code"].value_counts()
+        bars = ax.bar(counts.index, counts.values, color=["#c2410c", "#0b63ce", "#7c3aed"])
+        for bar, value in zip(bars, counts.values):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.2,
+                    str(value), ha="center", va="bottom")
+        ax.set_ylabel("Groups")
+        ax.set_title("Automatic VM Sweep Observations")
+        ax.grid(axis="y", alpha=0.2)
+        fig.tight_layout()
+        return fig
 
     def _save_plot(self):
         path = filedialog.asksaveasfilename(

@@ -1,9 +1,11 @@
 """Testable Phase 1 backend helpers for the Tkinter workbench."""
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
 from voltage_margin.core.config_loader import (
@@ -115,7 +117,12 @@ def run_phase1_pipeline(config: Phase1RunConfig) -> Phase1RunResult:
 
 
 def _read_csv(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path) if path.exists() else pd.DataFrame()
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
 
 
 def load_output_package(output_dir: Path) -> OutputTables:
@@ -152,6 +159,7 @@ def filter_margins(
     metric: str = "All",
     corner: str = "All",
     status: str = "All",
+    include_values: dict[str, set[str]] | None = None,
 ) -> pd.DataFrame:
     filtered = margins.copy()
     filters = {
@@ -164,7 +172,411 @@ def filter_margins(
     for column, value in filters.items():
         if value and value != "All" and column in filtered.columns:
             filtered = filtered[filtered[column].astype(str) == str(value)]
+    if include_values:
+        include_columns = {
+            "source": "compare_source",
+            "type": "analysis_type",
+            "metric": "metric",
+            "corner": "corner",
+            "status": "margin_status",
+        }
+        for key, values in include_values.items():
+            column = include_columns.get(key, key)
+            if column in filtered.columns and values is not None:
+                filtered = filtered[filtered[column].astype(str).isin(set(values))]
     return filtered
+
+
+def enrich_margin_rows(
+    margins: pd.DataFrame,
+    sensitivity: pd.DataFrame,
+    per_arc: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    if margins.empty or sensitivity.empty or "sensitivity_trace_id" not in margins.columns:
+        enriched = margins.copy()
+    else:
+        enrich_columns = [
+            "sensitivity_trace_id",
+            "low_source_refs_summary",
+            "high_source_refs_summary",
+            "sensitivity_formula",
+        ]
+        available = [column for column in enrich_columns if column in sensitivity.columns]
+        if available == ["sensitivity_trace_id"]:
+            enriched = margins.copy()
+        else:
+            lookup = sensitivity[available].drop_duplicates("sensitivity_trace_id")
+            enriched = margins.merge(lookup, on="sensitivity_trace_id", how="left")
+    if per_arc is None or per_arc.empty:
+        return enriched
+    join_cols = ["corner", "analysis_type", "metric", "arc"]
+    if not set(join_cols).issubset(enriched.columns) or not set(join_cols).issubset(per_arc.columns):
+        return enriched
+    per_arc_columns = join_cols + [
+        "rel_threshold",
+        "abs_threshold_ps",
+        "base_pass",
+        "ci_bounds_pass",
+        "mc_ci_lb_ps",
+        "mc_ci_ub_ps",
+    ]
+    available = [column for column in per_arc_columns if column in per_arc.columns]
+    lookup = per_arc[available].drop_duplicates(join_cols)
+    return enriched.merge(lookup, on=join_cols, how="left", suffixes=("", "_pass_rate"))
+
+
+def _truthy(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes"}
+    if pd.isna(value):
+        return False
+    return bool(value)
+
+
+def _truthy_series(series: pd.Series) -> pd.Series:
+    if series.empty:
+        return pd.Series(dtype=bool)
+    if series.dtype == object:
+        return series.astype(str).str.lower().isin(["true", "1", "yes"])
+    return series.fillna(False).astype(bool)
+
+
+def _finite(value):
+    numeric = pd.to_numeric(value, errors="coerce")
+    try:
+        return float(numeric) if math.isfinite(float(numeric)) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _base_pass(row) -> bool:
+    if "base_pass" in row and not pd.isna(row.get("base_pass")):
+        return _truthy(row.get("base_pass"))
+    return _passes_with_dif(row, _finite(row.get("dif_ps")))
+
+
+def _passes_with_dif(row, adjusted_dif) -> bool:
+    if adjusted_dif is None:
+        return False
+    mc_value = _finite(row.get("mc_value_ps"))
+    rel_threshold = _finite(row.get("rel_threshold"))
+    abs_threshold = _finite(row.get("abs_threshold_ps"))
+    rel_pass = False
+    abs_pass = False
+    if mc_value not in (None, 0.0) and rel_threshold is not None:
+        rel_pass = abs(adjusted_dif / abs(mc_value)) <= rel_threshold
+    if abs_threshold is not None:
+        abs_pass = abs(adjusted_dif) <= abs_threshold
+    ci_pass = _ci_pass(row, adjusted_dif)
+    return rel_pass or abs_pass or ci_pass
+
+
+def _ci_pass(row, adjusted_dif) -> bool:
+    mc_value = _finite(row.get("mc_value_ps"))
+    ci_lb = _finite(row.get("mc_ci_lb_ps"))
+    ci_ub = _finite(row.get("mc_ci_ub_ps"))
+    if mc_value is None or ci_lb is None or ci_ub is None:
+        return False
+    adjusted_lib = mc_value + adjusted_dif
+    lower = min(ci_lb, ci_ub)
+    upper = max(ci_lb, ci_ub)
+    return lower <= adjusted_lib <= upper
+
+
+def _numeric_series(df: pd.DataFrame, column: str, default=np.nan) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(default, index=df.index, dtype=float)
+    return pd.to_numeric(df[column], errors="coerce")
+
+
+def _base_pass_series(group: pd.DataFrame) -> pd.Series:
+    if "base_pass" in group.columns:
+        return _truthy_series(group["base_pass"]).reindex(group.index, fill_value=False)
+    return group.apply(_base_pass, axis=1)
+
+
+def _pass_series_with_vm(group: pd.DataFrame, margin_mv: int | float) -> pd.Series:
+    dif = _numeric_series(group, "dif_ps")
+    sensitivity = _numeric_series(group, "sensitivity_ps_per_mv").fillna(0.0)
+    adjusted_dif = dif + margin_mv * sensitivity
+    mc = _numeric_series(group, "mc_value_ps")
+    rel_threshold = _numeric_series(group, "rel_threshold")
+    abs_threshold = _numeric_series(group, "abs_threshold_ps")
+    rel_err = (adjusted_dif / mc.abs()).replace([np.inf, -np.inf], np.nan)
+    rel_pass = rel_err.abs() <= rel_threshold
+    abs_pass = adjusted_dif.abs() <= abs_threshold
+
+    ci_lb = _numeric_series(group, "mc_ci_lb_ps")
+    ci_ub = _numeric_series(group, "mc_ci_ub_ps")
+    lower = pd.concat([ci_lb, ci_ub], axis=1).min(axis=1)
+    upper = pd.concat([ci_lb, ci_ub], axis=1).max(axis=1)
+    adjusted_lib = mc + adjusted_dif
+    ci_pass = adjusted_lib.between(lower, upper)
+    return (rel_pass | abs_pass | ci_pass).fillna(False)
+
+
+def build_vm_sweep(
+    margins: pd.DataFrame,
+    max_margin_mv: int = 10,
+    step_mv: int = 1,
+    group_columns: Iterable[str] = ("compare_source", "corner", "analysis_type", "metric"),
+) -> pd.DataFrame:
+    group_columns = list(group_columns)
+    output_columns = [
+        "scope",
+        *group_columns,
+        "margin_mv",
+        "pass_count",
+        "total_count",
+        "base_pass_count",
+        "fixed_count",
+        "new_fail_count",
+        "pass_rate_pct",
+    ]
+    required = set(group_columns + ["dif_ps", "sensitivity_ps_per_mv"])
+    if margins.empty or not required.issubset(margins.columns):
+        return pd.DataFrame(columns=output_columns)
+
+    margin_points = list(range(0, int(max_margin_mv) + 1, int(step_mv)))
+    rows = []
+    for group_key, group in margins.groupby(group_columns, dropna=False):
+        group_values = dict(zip(group_columns, group_key if isinstance(group_key, tuple) else (group_key,)))
+        base_passes = _base_pass_series(group)
+        base_pass_count = int(base_passes.sum())
+        total = len(group)
+        for margin_mv in margin_points:
+            simulated = _pass_series_with_vm(group, margin_mv)
+            for scope in ["all_rows", "outliers_only"]:
+                if scope == "outliers_only":
+                    scoped_passes = base_passes | simulated
+                else:
+                    scoped_passes = simulated
+                pass_count = int(scoped_passes.sum())
+                fixed_count = int((~base_passes & scoped_passes).sum())
+                new_fail_count = int((base_passes & ~scoped_passes).sum())
+                rows.append(
+                    {
+                        "scope": scope,
+                        **group_values,
+                        "margin_mv": margin_mv,
+                        "pass_count": pass_count,
+                        "total_count": total,
+                        "base_pass_count": base_pass_count,
+                        "fixed_count": fixed_count,
+                        "new_fail_count": new_fail_count,
+                        "pass_rate_pct": round(pass_count / total * 100.0, 6) if total else 0.0,
+                    }
+                )
+    return pd.DataFrame(rows, columns=output_columns)
+
+
+def _trend_for_group(ordered: pd.DataFrame) -> str:
+    if ordered.empty:
+        return "unknown"
+    rates = ordered["pass_rate_pct"].astype(float)
+    if rates.is_monotonic_decreasing and rates.iloc[-1] < rates.iloc[0]:
+        return "declines"
+    best_index = rates.idxmax()
+    best_margin = ordered.loc[best_index, "margin_mv"]
+    if best_margin not in (ordered["margin_mv"].min(), ordered["margin_mv"].max()):
+        return "has_peak"
+    if rates.iloc[-1] > rates.iloc[0]:
+        return "improves"
+    return "flat"
+
+
+def build_vm_target_summary(
+    sweep: pd.DataFrame,
+    target_pass_rate_pct: float = 95.0,
+) -> pd.DataFrame:
+    group_columns = ["scope", "compare_source", "corner", "analysis_type", "metric"]
+    output_columns = group_columns + [
+        "target_pass_rate_pct",
+        "base_pr_pct",
+        "required_vm_mv",
+        "pass_rate_at_required_vm_pct",
+        "fixed_count_at_required_vm",
+        "new_fail_count_at_required_vm",
+        "best_vm_mv",
+        "best_pr_pct",
+        "trend",
+        "total_count",
+        "status",
+    ]
+    if sweep.empty or not set(group_columns).issubset(sweep.columns):
+        return pd.DataFrame(columns=output_columns)
+
+    rows = []
+    for group_key, group in sweep.groupby(group_columns, dropna=False):
+        ordered = group.sort_values("margin_mv", kind="mergesort")
+        base_rows = ordered[ordered["margin_mv"] == ordered["margin_mv"].min()]
+        base_pr = float(base_rows.iloc[0]["pass_rate_pct"]) if not base_rows.empty else 0.0
+        reaching = ordered[ordered["pass_rate_pct"] >= target_pass_rate_pct]
+        if reaching.empty:
+            selected = ordered.loc[ordered["pass_rate_pct"].astype(float).idxmax()]
+            status = "not_reached"
+            required_vm = None
+        else:
+            selected = reaching.iloc[0]
+            status = "ok"
+            required_vm = selected["margin_mv"]
+        best = ordered.loc[ordered["pass_rate_pct"].astype(float).idxmax()]
+        rows.append(
+            {
+                **dict(zip(group_columns, group_key if isinstance(group_key, tuple) else (group_key,))),
+                "target_pass_rate_pct": target_pass_rate_pct,
+                "base_pr_pct": base_pr,
+                "required_vm_mv": required_vm,
+                "pass_rate_at_required_vm_pct": float(selected["pass_rate_pct"]),
+                "fixed_count_at_required_vm": int(selected["fixed_count"]),
+                "new_fail_count_at_required_vm": int(selected["new_fail_count"]),
+                "best_vm_mv": best["margin_mv"],
+                "best_pr_pct": float(best["pass_rate_pct"]),
+                "trend": _trend_for_group(ordered),
+                "total_count": int(selected["total_count"]),
+                "status": status,
+            }
+        )
+    return pd.DataFrame(rows, columns=output_columns).sort_values(
+        ["status", "required_vm_mv", "base_pr_pct"],
+        ascending=[True, True, True],
+        kind="mergesort",
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def find_vm_observations(sweep: pd.DataFrame) -> pd.DataFrame:
+    group_columns = ["scope", "compare_source", "corner", "analysis_type", "metric"]
+    columns = [
+        *group_columns,
+        "observation_code",
+        "message",
+        "base_pr_pct",
+        "best_vm_mv",
+        "best_pr_pct",
+        "new_fail_count_at_best",
+    ]
+    if sweep.empty or not set(group_columns).issubset(sweep.columns):
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for group_key, group in sweep.groupby(group_columns, dropna=False):
+        ordered = group.sort_values("margin_mv", kind="mergesort")
+        base = ordered.iloc[0]
+        best = ordered.loc[ordered["pass_rate_pct"].astype(float).idxmax()]
+        values = dict(zip(group_columns, group_key if isinstance(group_key, tuple) else (group_key,)))
+        scope = values["scope"]
+        base_pr = float(base["pass_rate_pct"])
+        best_pr = float(best["pass_rate_pct"])
+        best_vm = best["margin_mv"]
+        if scope == "all_rows" and best_vm == base["margin_mv"] and best_pr >= float(ordered.iloc[-1]["pass_rate_pct"]):
+            if float(ordered.iloc[-1]["pass_rate_pct"]) < base_pr:
+                rows.append(
+                    {
+                        **values,
+                        "observation_code": "all_rows_degrades",
+                        "message": "All-rows VM reduces PR; pessimistic side creates new fails.",
+                        "base_pr_pct": base_pr,
+                        "best_vm_mv": best_vm,
+                        "best_pr_pct": best_pr,
+                        "new_fail_count_at_best": int(best["new_fail_count"]),
+                    }
+                )
+        if scope == "outliers_only" and best_vm not in (ordered["margin_mv"].min(), ordered["margin_mv"].max()):
+            rows.append(
+                {
+                    **values,
+                    "observation_code": "outliers_only_has_peak",
+                    "message": "Outliers-only VM has a best point before over-margin loses fixes.",
+                    "base_pr_pct": base_pr,
+                    "best_vm_mv": best_vm,
+                    "best_pr_pct": best_pr,
+                    "new_fail_count_at_best": int(best["new_fail_count"]),
+                }
+            )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_margin_audit_rows(margins: pd.DataFrame, limit: int = 500) -> pd.DataFrame:
+    if margins.empty:
+        return margins.copy()
+    audit = margins.copy()
+    base_pass = _base_pass_series(audit) if "base_pass" in audit.columns else pd.Series(False, index=audit.index)
+    audit["_base_fail_rank"] = (~base_pass).astype(int)
+    audit["_required_margin_sort"] = pd.to_numeric(
+        audit.get("required_margin_mv", 0), errors="coerce").fillna(-1)
+    audit = audit.sort_values(
+        ["_base_fail_rank", "_required_margin_sort"],
+        ascending=[False, False],
+        kind="mergesort",
+    ).head(limit)
+    return audit.drop(columns=["_base_fail_rank", "_required_margin_sort"], errors="ignore")
+
+
+def build_target_margin_plan(
+    margins: pd.DataFrame,
+    target_coverage: float = 0.95,
+    group_columns: Iterable[str] = ("compare_source", "corner", "analysis_type"),
+) -> pd.DataFrame:
+    group_columns = list(group_columns)
+    output_columns = group_columns + [
+        "target_coverage_pct",
+        "required_margin_mv",
+        "covered_rows",
+        "valid_rows",
+        "total_rows",
+        "skipped_rows",
+        "coverage_pct",
+        "worst_margin_mv",
+        "worst_metric",
+        "worst_arc",
+        "worst_source_file_relative",
+        "worst_source_line_number",
+        "worst_margin_trace_id",
+    ]
+    required = set(group_columns + ["required_margin_mv", "margin_status"])
+    if margins.empty or not required.issubset(margins.columns):
+        return pd.DataFrame(columns=output_columns)
+
+    rows = []
+    for group_key, group in margins.groupby(group_columns, dropna=False):
+        valid = group[
+            (group["margin_status"].astype(str) == "ok")
+            & pd.to_numeric(group["required_margin_mv"], errors="coerce").apply(math.isfinite)
+        ].copy()
+        valid["required_margin_mv"] = valid["required_margin_mv"].astype(float)
+        if valid.empty:
+            continue
+        ordered = valid.sort_values("required_margin_mv", kind="mergesort")
+        target_index = max(math.ceil(target_coverage * len(ordered)) - 1, 0)
+        target_row = ordered.iloc[target_index]
+        worst_row = ordered.iloc[-1]
+        covered = int((ordered["required_margin_mv"] <= target_row["required_margin_mv"]).sum())
+        rows.append(
+            {
+                **dict(zip(group_columns, group_key if isinstance(group_key, tuple) else (group_key,))),
+                "target_coverage_pct": target_coverage * 100.0,
+                "required_margin_mv": float(target_row["required_margin_mv"]),
+                "covered_rows": covered,
+                "valid_rows": len(valid),
+                "total_rows": len(group),
+                "skipped_rows": len(group) - len(valid),
+                "coverage_pct": covered / len(valid) * 100.0,
+                "worst_margin_mv": float(worst_row["required_margin_mv"]),
+                "worst_metric": str(worst_row.get("metric", "") or ""),
+                "worst_arc": str(worst_row.get("arc", "") or ""),
+                "worst_source_file_relative": str(
+                    worst_row.get("source_file_relative", "") or ""),
+                "worst_source_line_number": worst_row.get("source_line_number", ""),
+                "worst_margin_trace_id": str(worst_row.get("margin_trace_id", "") or ""),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=output_columns)
+    return pd.DataFrame(rows, columns=output_columns).sort_values(
+        ["required_margin_mv"] + group_columns,
+        ascending=[False] + [True] * len(group_columns),
+        kind="mergesort",
+    ).reset_index(drop=True)
 
 
 def summarize_margins(margins: pd.DataFrame, margin_trace: pd.DataFrame) -> MarginSummary:
@@ -212,6 +624,23 @@ def read_source_line(path: Path | str, line_number: int | str) -> str:
             if current == line_number:
                 return line.rstrip("\n")
     return ""
+
+
+def read_source_context(path: Path | str, line_number: int | str, radius: int = 2) -> str:
+    path = Path(path)
+    line_number = int(float(line_number))
+    start = max(line_number - radius, 1)
+    end = line_number + radius
+    lines = []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for current, line in enumerate(handle, start=1):
+            if current < start:
+                continue
+            if current > end:
+                break
+            marker = ">>" if current == line_number else "  "
+            lines.append(f"{marker} {current} | {line.rstrip()}")
+    return "\n".join(lines)
 
 
 def table_columns(df: pd.DataFrame, preferred: Iterable[str]) -> list[str]:
